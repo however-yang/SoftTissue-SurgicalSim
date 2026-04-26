@@ -1,0 +1,100 @@
+// DensitySplat.compute
+// GPU 加速的顶点密度 splatting
+// 每个活跃顶点向周围体素贡献 Wyvill 核密度
+// 使用整数原子加法模拟浮点原子操作，避免 race condition
+
+#pragma kernel ClearDensity
+#pragma kernel SplatVertices
+#pragma kernel ConvertToFloat4
+
+// ── 全局参数 ─────────────────────────────────────
+int _NumPointsPerAxis;
+float _CellSize;
+float3 _Origin;
+float _KernelRadius;
+int _NumVertices;
+
+// ── Buffers ──────────────────────────────────────
+RWStructuredBuffer<float4> _Points;      // 最终输出: xyz=位置, w=密度
+RWStructuredBuffer<int> _DensityInt;     // 整数密度场（用于原子加法）
+StructuredBuffer<float3> _Vertices;      // 顶点位置
+StructuredBuffer<int> _VertexActive;     // 顶点是否活跃
+
+// 精度：将浮点密度乘以此值转为整数
+static const int FIXED_POINT_SCALE = 10000;
+
+// ── 辅助函数 ─────────────────────────────────────
+int indexFromCoord(int x, int y, int z)
+{
+    return z * _NumPointsPerAxis * _NumPointsPerAxis + y * _NumPointsPerAxis + x;
+}
+
+// ── Kernel 0: 清空密度场 ──────────────────────────
+[numthreads(8, 8, 8)]
+void ClearDensity(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_NumPointsPerAxis || id.y >= (uint)_NumPointsPerAxis || id.z >= (uint)_NumPointsPerAxis)
+        return;
+
+    int idx = indexFromCoord(id.x, id.y, id.z);
+    // 初始密度 = -1.0 → 整数 = -FIXED_POINT_SCALE
+    _DensityInt[idx] = -FIXED_POINT_SCALE;
+}
+
+// ── Kernel 1: 顶点 Splatting（原子加法） ──────────
+[numthreads(256, 1, 1)]
+void SplatVertices(uint3 id : SV_DispatchThreadID)
+{
+    uint vi = id.x;
+    if (vi >= (uint)_NumVertices) return;
+    if (_VertexActive[vi] == 0) return;
+
+    float3 p = _Vertices[vi];
+    float r = _KernelRadius;
+    float r2 = r * r;
+    int voxelRadius = (int)ceil(r / _CellSize) + 1;
+
+    int cx = (int)round((p.x - _Origin.x) / _CellSize);
+    int cy = (int)round((p.y - _Origin.y) / _CellSize);
+    int cz = (int)round((p.z - _Origin.z) / _CellSize);
+
+    int x0 = max(0, cx - voxelRadius);
+    int x1 = min(_NumPointsPerAxis - 1, cx + voxelRadius);
+    int y0 = max(0, cy - voxelRadius);
+    int y1 = min(_NumPointsPerAxis - 1, cy + voxelRadius);
+    int z0 = max(0, cz - voxelRadius);
+    int z1 = min(_NumPointsPerAxis - 1, cz + voxelRadius);
+
+    for (int iz = z0; iz <= z1; iz++)
+    {
+        for (int iy = y0; iy <= y1; iy++)
+        {
+            for (int ix = x0; ix <= x1; ix++)
+            {
+                float3 vp = _Origin + float3(ix, iy, iz) * _CellSize;
+                float dist2 = dot(vp - p, vp - p);
+                if (dist2 > r2) continue;
+
+                float s = 1.0 - dist2 / r2;
+                float contribution = s * s * s;
+
+                int idx = indexFromCoord(ix, iy, iz);
+                int intContrib = (int)(contribution * FIXED_POINT_SCALE);
+                InterlockedAdd(_DensityInt[idx], intContrib);
+            }
+        }
+    }
+}
+
+// ── Kernel 2: 整数密度 → float4 输出 ──────────────
+[numthreads(8, 8, 8)]
+void ConvertToFloat4(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_NumPointsPerAxis || id.y >= (uint)_NumPointsPerAxis || id.z >= (uint)_NumPointsPerAxis)
+        return;
+
+    int idx = indexFromCoord(id.x, id.y, id.z);
+    float3 pos = _Origin + float3(id.x, id.y, id.z) * _CellSize;
+    float density = (float)_DensityInt[idx] / (float)FIXED_POINT_SCALE;
+    _Points[idx] = float4(pos, density);
+}

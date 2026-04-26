@@ -1,0 +1,325 @@
+// XPBDSolver.compute — NeoHookean 弹性 + Graph Coloring GS
+// 参考: FantasyVR/neohookean_XPBD (Taichi 实现)
+// 论文: Peng Yu et al., "Parallel Constraint Graph Partitioning
+//       and Coloring for Realtime Soft-Body Cutting", EG 2025
+
+#pragma kernel CSIntegrate
+#pragma kernel CSSolveEdges
+#pragma kernel CSSolveNeoHookeanDev
+#pragma kernel CSSolveNeoHookeanHyd
+#pragma kernel CSPostSolve
+#pragma kernel CSGroundCollision
+
+// ═══════════════════════════════════════════════════════
+// Uniforms
+// ═══════════════════════════════════════════════════════
+float  _Dt;
+float  _GravityX, _GravityY, _GravityZ;
+float  _EdgeAlpha;       // edgeCompliance / (dt*dt)
+float  _GroundY;
+float  _Damping;         // 速度阻尼 (0~1)
+float  _Omega;           // SOR 松弛因子 (0~1), 模拟 Jacobi 平均化效果
+uint   _NumParticles;
+uint   _NumTets;
+uint   _NumEdges;
+uint   _GroupOffset;      // Graph Coloring: 当前颜色组的起始偏移
+uint   _GroupCount;       // Graph Coloring: 当前颜色组的大小
+
+// ═══════════════════════════════════════════════════════
+// Buffers
+// ═══════════════════════════════════════════════════════
+RWStructuredBuffer<float4> _Positions;
+RWStructuredBuffer<float4> _PrevPositions;
+RWStructuredBuffer<float4> _Velocities;
+RWStructuredBuffer<float>  _InvMasses;
+
+StructuredBuffer<uint4>    _TetIds;
+StructuredBuffer<float>    _RestVolumes;
+StructuredBuffer<int>      _TetActive;
+
+// NeoHookean: B^{-1} 矩阵 (每个 tet 一个 3x3，存储为 3 个 float4 = 9 floats)
+// 布局: _InvRestMatrix[t*3+0] = row0, _InvRestMatrix[t*3+1] = row1, _InvRestMatrix[t*3+2] = row2
+StructuredBuffer<float4>   _InvRestMatrix;
+
+// NeoHookean: alpha 参数 (per-tet)
+StructuredBuffer<float>    _AlphaDeviatoric;  // 1/(h^2 * mu * V)
+StructuredBuffer<float>    _AlphaHydrostatic; // 1/(h^2 * lambda * V)
+
+StructuredBuffer<uint2>    _EdgeIds;
+StructuredBuffer<float>    _RestLengths;
+StructuredBuffer<int>      _EdgeActive;
+StructuredBuffer<int>      _ColorGroupFlat;      // tet 颜色组
+StructuredBuffer<int>      _EdgeColorGroupFlat;   // edge 颜色组
+
+// ═══════════════════════════════════════════════════════
+// Helper functions
+// ═══════════════════════════════════════════════════════
+float det3x3(float3x3 M)
+{
+    return M[0][0] * (M[1][1]*M[2][2] - M[1][2]*M[2][1])
+         - M[0][1] * (M[1][0]*M[2][2] - M[1][2]*M[2][0])
+         + M[0][2] * (M[1][0]*M[2][1] - M[1][1]*M[2][0]);
+}
+
+float3x3 LoadInvRestMatrix(uint tetIdx)
+{
+    float4 r0 = _InvRestMatrix[tetIdx * 3 + 0];
+    float4 r1 = _InvRestMatrix[tetIdx * 3 + 1];
+    float4 r2 = _InvRestMatrix[tetIdx * 3 + 2];
+    return float3x3(
+        r0.x, r0.y, r0.z,
+        r1.x, r1.y, r1.z,
+        r2.x, r2.y, r2.z
+    );
+}
+
+// ═══════════════════════════════════════════════════════
+// Kernel 0: PreSolve（积分）
+// vel += dt*gravity; prevPos = pos; pos += dt*vel
+// ═══════════════════════════════════════════════════════
+[numthreads(64,1,1)]
+void CSIntegrate(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _NumParticles) return;
+    if (_InvMasses[i] == 0.0f) return;
+
+    float3 grav = float3(_GravityX, _GravityY, _GravityZ);
+    float3 pos  = _Positions[i].xyz;
+
+    // NaN 恢复: 如果上一步产生了 NaN，恢复到 prevPos
+    if (isnan(pos.x) || isnan(pos.y) || isnan(pos.z))
+    {
+        pos = _PrevPositions[i].xyz;
+        _Velocities[i] = float4(0, 0, 0, 0);
+        _Positions[i] = float4(pos, 0);
+        return;
+    }
+
+    float3 vel  = _Velocities[i].xyz + _Dt * grav;
+    _PrevPositions[i] = float4(pos, 0);
+    _Positions[i]     = float4(pos + _Dt * vel, 0);
+    _Velocities[i]    = float4(vel, 0);
+}
+
+// ═══════════════════════════════════════════════════════
+// Kernel 1: SolveEdges（Graph Coloring GS）
+// 保留边约束用于额外 damping/stability
+// ═══════════════════════════════════════════════════════
+[numthreads(64,1,1)]
+void CSSolveEdges(uint3 id : SV_DispatchThreadID)
+{
+    uint li = id.x;
+    if (li >= _GroupCount) return;
+
+    uint e = (uint)_EdgeColorGroupFlat[_GroupOffset + li];
+    if (e >= _NumEdges) return;
+    if (_EdgeActive[e] == 0) return;
+
+    uint2 eids = _EdgeIds[e];
+    float w0 = _InvMasses[eids.x];
+    float w1 = _InvMasses[eids.y];
+    float wTot = w0 + w1;
+    if (wTot == 0.0f) return;
+
+    float3 diff = _Positions[eids.x].xyz - _Positions[eids.y].xyz;
+    float l = length(diff);
+    if (l == 0.0f) return;
+
+    float3 gradC = diff / l;
+    float C = l - _RestLengths[e];
+    float lambda = -C / (wTot + _EdgeAlpha) * _Omega;
+
+    _Positions[eids.x] = float4(_Positions[eids.x].xyz + lambda * w0 * gradC, 0);
+    _Positions[eids.y] = float4(_Positions[eids.y].xyz - lambda * w1 * gradC, 0);
+}
+
+// ═══════════════════════════════════════════════════════
+// Kernel 2: NeoHookean Deviatoric Constraint
+// C_dev = tr(F^T · F) - 3
+// 参考: FantasyVR/neohookean_XPBD line 96-124
+// ═══════════════════════════════════════════════════════
+[numthreads(64,1,1)]
+void CSSolveNeoHookeanDev(uint3 id : SV_DispatchThreadID)
+{
+    uint li = id.x;
+    if (li >= _GroupCount) return;
+
+    uint t = (uint)_ColorGroupFlat[_GroupOffset + li];
+    if (t >= _NumTets) return;
+    if (_TetActive[t] == 0) return;
+
+    uint4 ids = _TetIds[t];
+    float3 p0 = _Positions[ids.x].xyz;
+    float3 p1 = _Positions[ids.y].xyz;
+    float3 p2 = _Positions[ids.z].xyz;
+    float3 p3 = _Positions[ids.w].xyz;
+
+    // D_s = [p1-p0, p2-p0, p3-p0] (列主序)
+    float3 e1 = p1 - p0;
+    float3 e2 = p2 - p0;
+    float3 e3 = p3 - p0;
+
+    // B = D_m^{-1} (from rest pose)
+    float3x3 B = LoadInvRestMatrix(t);
+
+    // F = D_s @ B (变形梯度)
+    // F[i,j] = sum_k D_s[i,k] * B[k,j]
+    // D_s 列主序: D_s[:,0]=e1, D_s[:,1]=e2, D_s[:,2]=e3
+    // → D_s[i,0]=e1[i], D_s[i,1]=e2[i], D_s[i,2]=e3[i]
+    float3x3 Ds = float3x3(
+        e1.x, e2.x, e3.x,
+        e1.y, e2.y, e3.y,
+        e1.z, e2.z, e3.z
+    );
+    float3x3 F = mul(Ds, B);
+
+    // C = tr(F^T · F) - 3
+    float rs = dot(F[0], F[0]) + dot(F[1], F[1]) + dot(F[2], F[2]); // = tr(F^T F)
+    float constraint = rs - 3.0;
+
+    // G = 2 * F @ B^T (梯度矩阵, 对 p1,p2,p3)
+    float3x3 BT = transpose(B);
+    float3x3 G = mul(F, BT) * 2.0;
+
+    // g1 = G 的第一列, g2 = 第二列, g3 = 第三列
+    float3 g1 = float3(G[0][0], G[1][0], G[2][0]);
+    float3 g2 = float3(G[0][1], G[1][1], G[2][1]);
+    float3 g3 = float3(G[0][2], G[1][2], G[2][2]);
+    float3 g0 = -(g1 + g2 + g3);
+
+    float w0 = _InvMasses[ids.x];
+    float w1 = _InvMasses[ids.y];
+    float w2 = _InvMasses[ids.z];
+    float w3 = _InvMasses[ids.w];
+
+    float sumW = w0 * dot(g0, g0) + w1 * dot(g1, g1) +
+                 w2 * dot(g2, g2) + w3 * dot(g3, g3);
+
+    float alpha = _AlphaDeviatoric[t];  // 已在 Init 中烘入 1/(h²*μ*V)
+    float denom = sumW + alpha;
+    if (denom < 1e-10) return;
+
+    float dlambda = -constraint / denom * _Omega;
+    if (isnan(dlambda) || isinf(dlambda)) return;
+
+    _Positions[ids.x] = float4(p0 + w0 * dlambda * g0, 0);
+    _Positions[ids.y] = float4(p1 + w1 * dlambda * g1, 0);
+    _Positions[ids.z] = float4(p2 + w2 * dlambda * g2, 0);
+    _Positions[ids.w] = float4(p3 + w3 * dlambda * g3, 0);
+}
+
+// ═══════════════════════════════════════════════════════
+// Kernel 3: NeoHookean Hydrostatic Constraint
+// C_hyd = det(F) - 1
+// 参考: FantasyVR/neohookean_XPBD line 126-156
+// ═══════════════════════════════════════════════════════
+[numthreads(64,1,1)]
+void CSSolveNeoHookeanHyd(uint3 id : SV_DispatchThreadID)
+{
+    uint li = id.x;
+    if (li >= _GroupCount) return;
+
+    uint t = (uint)_ColorGroupFlat[_GroupOffset + li];
+    if (t >= _NumTets) return;
+    if (_TetActive[t] == 0) return;
+
+    uint4 ids = _TetIds[t];
+    // 重新读取位置（deviatoric 已经修改了位置）
+    float3 p0 = _Positions[ids.x].xyz;
+    float3 p1 = _Positions[ids.y].xyz;
+    float3 p2 = _Positions[ids.z].xyz;
+    float3 p3 = _Positions[ids.w].xyz;
+
+    float3 e1 = p1 - p0;
+    float3 e2 = p2 - p0;
+    float3 e3 = p3 - p0;
+
+    float3x3 B = LoadInvRestMatrix(t);
+    float3x3 Ds = float3x3(
+        e1.x, e2.x, e3.x,
+        e1.y, e2.y, e3.y,
+        e1.z, e2.z, e3.z
+    );
+    float3x3 F = mul(Ds, B);
+
+    // F 的列向量
+    float3 f1 = float3(F[0][0], F[1][0], F[2][0]); // F 第一列
+    float3 f2 = float3(F[0][1], F[1][1], F[2][1]); // F 第二列
+    float3 f3 = float3(F[0][2], F[1][2], F[2][2]); // F 第三列
+
+    // Cofactor 矩阵（用于 det(F) 的梯度）
+    float3 df0 = cross(f2, f3);
+    float3 df1 = cross(f3, f1);
+    float3 df2 = cross(f1, f2);
+
+    // G = [df0, df1, df2] @ B^T (cofactor 矩阵 × B 转置)
+    float3x3 cofM = float3x3(
+        df0.x, df1.x, df2.x,
+        df0.y, df1.y, df2.y,
+        df0.z, df1.z, df2.z
+    );
+    float3x3 BT = transpose(B);
+    float3x3 G = mul(cofM, BT);
+
+    float3 g1 = float3(G[0][0], G[1][0], G[2][0]);
+    float3 g2 = float3(G[0][1], G[1][1], G[2][1]);
+    float3 g3 = float3(G[0][2], G[1][2], G[2][2]);
+    float3 g0 = -(g1 + g2 + g3);
+
+    // C = det(F) - 1 (手动计算，避免 HLSL determinant 兼容问题)
+    float constraint = det3x3(F) - 1.0;
+
+    float w0 = _InvMasses[ids.x];
+    float w1 = _InvMasses[ids.y];
+    float w2 = _InvMasses[ids.z];
+    float w3 = _InvMasses[ids.w];
+
+    float sumW = w0 * dot(g0, g0) + w1 * dot(g1, g1) +
+                 w2 * dot(g2, g2) + w3 * dot(g3, g3);
+
+    float alpha = _AlphaHydrostatic[t];  // 已在 Init 中烘入 1/(h²*λ*V)
+    float denom = sumW + alpha;
+    if (denom < 1e-10) return;
+
+    float dlambda = -constraint / denom * _Omega;
+    if (isnan(dlambda) || isinf(dlambda)) return;
+
+    _Positions[ids.x] = float4(p0 + w0 * dlambda * g0, 0);
+    _Positions[ids.y] = float4(p1 + w1 * dlambda * g1, 0);
+    _Positions[ids.z] = float4(p2 + w2 * dlambda * g2, 0);
+    _Positions[ids.w] = float4(p3 + w3 * dlambda * g3, 0);
+}
+
+// ═══════════════════════════════════════════════════════
+// Kernel 4: PostSolve（速度更新 + 阻尼）
+// ═══════════════════════════════════════════════════════
+[numthreads(64,1,1)]
+void CSPostSolve(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _NumParticles) return;
+    if (_InvMasses[i] == 0.0f) return;
+
+    float3 v = (_Positions[i].xyz - _PrevPositions[i].xyz) / _Dt;
+    v *= (1.0 - _Damping);  // 阻尼
+    _Velocities[i] = float4(v, 0);
+}
+
+// ═══════════════════════════════════════════════════════
+// Kernel 5: 地面碰撞
+// ═══════════════════════════════════════════════════════
+[numthreads(64,1,1)]
+void CSGroundCollision(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _NumParticles) return;
+
+    float3 pos = _Positions[i].xyz;
+    if (pos.y < _GroundY)
+    {
+        float3 prev = _PrevPositions[i].xyz;
+        prev.y = _GroundY;
+        _Positions[i] = float4(prev, 0);
+    }
+}

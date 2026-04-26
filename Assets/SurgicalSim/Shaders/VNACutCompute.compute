@@ -1,0 +1,108 @@
+// VNACutCompute.compute
+// GPU 加速的 VNA 交叉检测
+// 功能: 对 tet 的边进行平面交叉检测，输出交叉点重心坐标
+
+#pragma kernel CSPlaneEdgeIntersect
+#pragma kernel CSClassifyVertices
+
+// ── 输入 ────────────────────────────────────────────────
+StructuredBuffer<float4>  _VNAPositions;     // 顶点位置
+StructuredBuffer<uint4>   _VNATetIds;        // tet 索引
+StructuredBuffer<int>     _VNATetActive;     // tet 活跃状态
+StructuredBuffer<int>     _AffectedTetList;  // 受影响的 tet 索引列表
+
+// 切割平面参数
+float3 _PlanePoint;
+float3 _PlaneNormal;
+
+uint _NumAffectedTets;
+uint _NumParticles;
+
+// ── 输出 ────────────────────────────────────────────────
+// 每个 tet 最多 6 条边，每条边的交叉结果
+// EdgeIntersectResult[tetLocalIdx * 6 + edgeIdx]
+// x = 是否有交叉 (0/1)
+// y = 权重 w0 (靠近第一个顶点)
+// z = 权重 w1
+// w = 未使用
+RWStructuredBuffer<float4> _EdgeIntersectResults;
+
+// 每个顶点到切割平面的带符号距离
+RWStructuredBuffer<float>  _VertexPlaneDistances;
+
+// 每个 tet 的 4 个顶点的侧面分类 (>0 = 正面, <0 = 反面)
+RWStructuredBuffer<int4>   _VertexSides;
+
+// ════════════════════════════════════════════════════════
+// Kernel 0: 对每个受影响 tet 的 6 条边做平面交叉检测
+// ════════════════════════════════════════════════════════
+[numthreads(64, 1, 1)]
+void CSPlaneEdgeIntersect(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _NumAffectedTets) return;
+
+    int tetIdx = _AffectedTetList[idx];
+    if (_VNATetActive[tetIdx] == 0) return;
+
+    uint4 ids = _VNATetIds[tetIdx];
+    float3 pos[4];
+    pos[0] = _VNAPositions[ids.x].xyz;
+    pos[1] = _VNAPositions[ids.y].xyz;
+    pos[2] = _VNAPositions[ids.z].xyz;
+    pos[3] = _VNAPositions[ids.w].xyz;
+
+    // 计算 4 个顶点到平面的距离
+    float dist[4];
+    int side[4]; // +1 = 正面, -1 = 反面
+    for (int i = 0; i < 4; i++)
+    {
+        dist[i] = dot(pos[i] - _PlanePoint, _PlaneNormal);
+        side[i] = dist[i] >= 0 ? 1 : -1;
+    }
+
+    // 输出顶点侧面分类
+    _VertexSides[idx] = int4(side[0], side[1], side[2], side[3]);
+
+    // 6 条边的局部索引
+    // {0,1}, {0,2}, {0,3}, {1,2}, {1,3}, {2,3}
+    static const int2 edgePairs[6] = {
+        int2(0,1), int2(0,2), int2(0,3),
+        int2(1,2), int2(1,3), int2(2,3)
+    };
+
+    uint resultBase = idx * 6;
+    for (int e = 0; e < 6; e++)
+    {
+        int a = edgePairs[e].x;
+        int b = edgePairs[e].y;
+
+        if (dist[a] * dist[b] < 0) // 两端在平面不同侧
+        {
+            float absA = abs(dist[a]);
+            float absB = abs(dist[b]);
+            float wA = absB / (absA + absB);
+            float wB = 1.0 - wA;
+
+            _EdgeIntersectResults[resultBase + e] = float4(1.0, wA, wB, 0);
+        }
+        else
+        {
+            _EdgeIntersectResults[resultBase + e] = float4(0, 0, 0, 0);
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════
+// Kernel 1: 对所有顶点计算到切割平面的距离
+// （用于后续的顶点分类）
+// ════════════════════════════════════════════════════════
+[numthreads(64, 1, 1)]
+void CSClassifyVertices(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _NumParticles) return;
+
+    float3 pos = _VNAPositions[i].xyz;
+    _VertexPlaneDistances[i] = dot(pos - _PlanePoint, _PlaneNormal);
+}
