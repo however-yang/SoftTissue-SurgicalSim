@@ -153,23 +153,8 @@ namespace SurgicalSim.CuttingV3
         // ── 碰触检测: 刀刃线段是否接近肝脏 ──────────────────
         bool IsBladeNearMesh(Vector3 bladeA, Vector3 bladeB)
         {
-            // 1. 快速 AABB 检查
-            if (_visualizer != null)
-            {
-                var mf = _visualizer.GetComponent<MeshFilter>();
-                if (mf != null && mf.mesh != null)
-                {
-                    Bounds b = mf.mesh.bounds;
-                    b.Expand(contactRadius * 2f);
-                    // 刀刃线段的 AABB
-                    Vector3 bMin = Vector3.Min(bladeA, bladeB) - Vector3.one * contactRadius;
-                    Vector3 bMax = Vector3.Max(bladeA, bladeB) + Vector3.one * contactRadius;
-                    if (!b.Intersects(new Bounds((bMin+bMax)*0.5f, bMax-bMin)))
-                        return false;
-                }
-            }
-
-            // 2. 检测刀刃线段附近是否有 tet 顶点
+            // 检测刀刃线段附近是否有 tet 顶点
+            // 不要使用 mf.mesh.bounds, 因为在软体形变时 Unity 的 Bounds 可能会缓存过时数据，导致切到一半停止！
             float r2 = contactRadius * contactRadius;
             for (int t = 0; t < _data.NumTets; t++)
             {
@@ -213,6 +198,14 @@ namespace SurgicalSim.CuttingV3
         public void FlushCutToGPU()
         {
             if (_data == null || _solver == null || _cutter == null) return;
+
+            // Continually monitor and automatically break any "lotus root silk" (highly stretched tets)
+            // with a smart absolute length threshold (e.g. 2cm) so it NEVER breaks normal small surface slivers.
+            if (_cutter is TetSubdivisionCutter tCutter)
+            {
+                tCutter.RemoveStretchedTets(5.0f, 0.02f);
+            }
+
             if (!_cutter.IsDirty) return;
 
             _framesSinceFlush++;

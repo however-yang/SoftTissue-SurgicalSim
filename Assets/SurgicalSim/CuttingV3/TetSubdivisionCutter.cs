@@ -1,4 +1,4 @@
-﻿// TetSubdivisionCutter.cs — Phase 2: 论文级切割质量
+// TetSubdivisionCutter.cs — Phase 2: 论文级切割质量
 //
 // 基于 PG2025 "Parallel Constraint Graph Partitioning and Coloring
 //              for Realtime Soft-Body Cutting" (Peng Yu et al.)
@@ -72,9 +72,12 @@ namespace SurgicalSim.CuttingV3
             Debug.Log($"[SweptCutter] Init V:{data.NumParticles} T:{data.NumTets}");
         }
 
+        private Vector3 _lastValidNormal = Vector3.zero;
+
         public void ResetStroke()
         {
             LastRejectReason = "not_cutting";
+            _lastValidNormal = Vector3.zero;
             // 新划刀：双层缓存全部清除，顶点计数重置
             _frameSplitCache.Clear();
             _strokeSplitCache.Clear();
@@ -123,8 +126,22 @@ namespace SurgicalSim.CuttingV3
             Vector3 planeNormal = Vector3.Cross(bladeDir, moveDir);
             float planeNLen = planeNormal.magnitude;
             if (planeNLen < 1e-4f)
-            { LastRejectReason = "parallel_move"; return result; }
-            planeNormal /= planeNLen;
+            { 
+                if (_lastValidNormal != Vector3.zero)
+                {
+                    planeNormal = _lastValidNormal;
+                }
+                else
+                {
+                    LastRejectReason = "parallel_move"; 
+                    return result; 
+                }
+            }
+            else
+            {
+                planeNormal /= planeNLen;
+                _lastValidNormal = planeNormal;
+            }
 
             Vector3 planeCenter = (A1 + B1) * 0.5f;
 
@@ -448,6 +465,71 @@ namespace SurgicalSim.CuttingV3
         }
 
         // ══════════════════════════════════════════════════════
+        public int RemoveStretchedTets(float maxStretchRatio = 5.0f, float minAbsoluteLength = 0.02f)
+        {
+            if (_data == null) return 0;
+            int removedCount = 0;
+            
+            float sqrMaxRatio = maxStretchRatio * maxStretchRatio;
+            float sqrMinLen = minAbsoluteLength * minAbsoluteLength;
+
+            for (int t = 0; t < _data.NumTets; t++)
+            {
+                if (!_data.TetActive[t]) continue;
+                
+                int b = t * 4;
+                int v0 = _data.TetIds[b + 0];
+                int v1 = _data.TetIds[b + 1];
+                int v2 = _data.TetIds[b + 2];
+                int v3 = _data.TetIds[b + 3];
+
+                Vector3 p0 = _data.Positions[v0];
+                Vector3 p1 = _data.Positions[v1];
+                Vector3 p2 = _data.Positions[v2];
+                Vector3 p3 = _data.Positions[v3];
+
+                Vector3 r0 = _data.RestPositions[v0];
+                Vector3 r1 = _data.RestPositions[v1];
+                Vector3 r2 = _data.RestPositions[v2];
+                Vector3 r3 = _data.RestPositions[v3];
+
+                bool isStretched = false;
+                
+                // Check if the edge is both highly stretched AND physically very long
+                bool CheckEdge(Vector3 cpA, Vector3 cpB, Vector3 crA, Vector3 crB)
+                {
+                    float currentSqr = (cpA - cpB).sqrMagnitude;
+                    if (currentSqr < sqrMinLen) return false; // Ignore short edges (prevents eroding the surface slivers)
+                    
+                    float restSqr = (crA - crB).sqrMagnitude;
+                    if (restSqr < 1e-12f) return true; // Zero rest length but current length > minLen (degenerate stretched)
+                    
+                    return (currentSqr / restSqr) > sqrMaxRatio;
+                }
+
+                if (CheckEdge(p0, p1, r0, r1)) isStretched = true;
+                else if (CheckEdge(p0, p2, r0, r2)) isStretched = true;
+                else if (CheckEdge(p0, p3, r0, r3)) isStretched = true;
+                else if (CheckEdge(p1, p2, r1, r2)) isStretched = true;
+                else if (CheckEdge(p1, p3, r1, r3)) isStretched = true;
+                else if (CheckEdge(p2, p3, r2, r3)) isStretched = true;
+
+                if (isStretched)
+                {
+                    _data.TetActive[t] = false;
+                    removedCount++;
+                    _dirty = true;
+                }
+            }
+
+            if (removedCount > 0)
+            {
+                Debug.Log($"[TetSubdivisionCutter] 清理藕断丝连: 已熔断 {removedCount} 个拉伸异形四面体!");
+            }
+
+            return removedCount;
+        }
+
         public void FlushToGPU()
         {
             if (!_dirty) return;
