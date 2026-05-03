@@ -203,7 +203,7 @@ namespace SurgicalSim.CuttingV3
             // with a smart absolute length threshold (e.g. 2cm) so it NEVER breaks normal small surface slivers.
             if (_cutter is TetSubdivisionCutter tCutter)
             {
-                tCutter.RemoveStretchedTets(5.0f, 0.02f);
+                tCutter.RemoveStretchedTets(5.0f, 0.003f); // Lowered absolute length to 3mm to catch tiny lotus roots
             }
 
             if (!_cutter.IsDirty) return;

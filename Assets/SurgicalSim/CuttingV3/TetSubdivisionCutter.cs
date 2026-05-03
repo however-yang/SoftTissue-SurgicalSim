@@ -34,9 +34,9 @@ namespace SurgicalSim.CuttingV3
         readonly Dictionary<long, (int posV, int negV)> _strokeSplitCache
             = new Dictionary<long, (int, int)>();
         readonly Dictionary<int, int> _frameSnapCache = new Dictionary<int, int>();
-        // ★ 跨帧一致性缓存：强制一个顶点在整个切割 Stroke 中只能保持最初始的拓扑侧
-        // 防止切割平面旋转导致某个已被切开的顶点突然“翻面”，从而将两侧断开的肉又缝合在一起形成藕断丝连。
-        readonly Dictionary<int, int> _strokeVertexSide = new Dictionary<int, int>();
+        
+        struct VertexSideLock { public int side; public Vector3 normal; }
+        readonly Dictionary<int, VertexSideLock> _strokeVertexSide = new Dictionary<int, VertexSideLock>();
 
         int _originalVertCount;
         int _strokeStartVertCount;
@@ -73,11 +73,13 @@ namespace SurgicalSim.CuttingV3
         }
 
         private Vector3 _lastValidNormal = Vector3.zero;
+        private Vector3 _strokeBaseNormal = Vector3.zero;
 
         public void ResetStroke()
         {
             LastRejectReason = "not_cutting";
             _lastValidNormal = Vector3.zero;
+            _strokeBaseNormal = Vector3.zero;
             // 新划刀：双层缓存全部清除，顶点计数重置
             _frameSplitCache.Clear();
             _strokeSplitCache.Clear();
@@ -140,6 +142,23 @@ namespace SurgicalSim.CuttingV3
             else
             {
                 planeNormal /= planeNLen;
+                
+                // ★ 智能分段：当刀片发生明显转弯（累计超过 25 度）时，解锁新生成的子四面体，允许二次切割。
+                if (_strokeBaseNormal == Vector3.zero)
+                {
+                    _strokeBaseNormal = planeNormal;
+                }
+                else
+                {
+                    float angle = Vector3.Angle(_strokeBaseNormal, planeNormal);
+                    if (angle > 25f)
+                    {
+                        Debug.Log($"[TetSubdivisionCutter] 检测到刀刃累计转弯 {angle:F1} 度，解锁子四面体二次切割！");
+                        _strokeStartTetCount = _data.NumTets;
+                        _strokeStartVertCount = _data.NumParticles;
+                        _strokeBaseNormal = planeNormal; // 重置基准法线
+                    }
+                }
                 _lastValidNormal = planeNormal;
             }
 
@@ -199,10 +218,10 @@ namespace SurgicalSim.CuttingV3
 
                 // 3. ★ 终极跨帧一致性修复：锁定顶点侧，防止平面旋转导致的跨帧拓扑翻转！
                 // 如果一个顶点在之前的帧被判断在正侧，刀刃旋转后它不能跑到负侧去，否则会缝合断开的面形成藕断丝连。
-                d0 = EnforceConsistentSide(i0, d0);
-                d1 = EnforceConsistentSide(i1, d1);
-                d2 = EnforceConsistentSide(i2, d2);
-                d3 = EnforceConsistentSide(i3, d3);
+                d0 = EnforceConsistentSide(i0, d0, planeNormal);
+                d1 = EnforceConsistentSide(i1, d1, planeNormal);
+                d2 = EnforceConsistentSide(i2, d2, planeNormal);
+                d3 = EnforceConsistentSide(i3, d3, planeNormal);
 
                 // 4. Trajectory Correction (平面吸附)
                 const float SNAP_DIST = 1e-4f;
@@ -349,17 +368,15 @@ namespace SurgicalSim.CuttingV3
             var (h1p, h1n) = EP(D_, B, dD, dB);
 
             // 正侧 (A, D_)
-            // ★ 修复论文的致命缺陷: 论文给出的拓扑 (AE1F1H1, ADF1H1, DF1G1H1)
-            // 在面 ADC 和 DBC 上的对角线与 Case 1 产生冲突，导致疯狂拉丝撕裂！
-            // 必须使用重新推导的全局一致性三角化，严格对齐 min-max ID：
+            // ★ 全局一致性三角化：严格对齐 min-max ID
+            AT(A, e1p, f1p, g1p);
+            AT(A, e1p, g1p, h1p);
             AT(A, D_, g1p, h1p);
-            AT(A, g1p, f1p, h1p);
-            AT(A, e1p, f1p, h1p);
 
             // 负侧 (B, C)
-            AT(B, C,   f1n, g1n);
-            AT(B, f1n, g1n, h1n);
-            AT(B, e1n, f1n, h1n);
+            AT(B, e1n, f1n, g1n);
+            AT(B, e1n, g1n, h1n);
+            AT(B, C, f1n, g1n);
         }
 
         // ═══════════════════════════════════════════════════════
@@ -379,6 +396,8 @@ namespace SurgicalSim.CuttingV3
             // 1. 帧级 split 缓存：同帧内同边只切一次
             if (_frameSplitCache.TryGetValue(key, out var frameCached)) return frameCached;
 
+            float t = da / (da - db);
+
             // 2. 划刀级缓存：原始边跨帧拓扑复用
             bool isOriginalEdge = (va < _strokeStartVertCount) && (vb < _strokeStartVertCount);
             if (isOriginalEdge && _strokeSplitCache.TryGetValue(key, out var strokeCached))
@@ -387,16 +406,11 @@ namespace SurgicalSim.CuttingV3
                 return strokeCached;
             }
 
-            float t = da / (da - db);
             (int posV, int negV) result;
 
-            if (t <= 1e-4f)
+            if (t <= 1e-4f || Mathf.Abs(da) <= 1.05e-4f)
             {
                 // ★ 核心修复：snap 时同一帧内同一顶点的克隆必须复用！
-                // 当孤立顶点 A 有 dA≈0 时，从 A 出发到 B/C/D 的三条边都会 snap 到 A，
-                // 如果每条边各自独立克隆 A，就会产生 clone_A1/clone_A2/clone_A3 三个独立粒子，
-                // 它们初始位置相同，但在物理引擎下各自受力，形成「单点相连的丝线」。
-                // 用 _frameSnapCache 确保同一帧内 va 只克隆一次，所有边共用同一个克隆。
                 if (!_frameSnapCache.TryGetValue(va, out int va_dup))
                 {
                     va_dup = Clone(va);
@@ -404,7 +418,7 @@ namespace SurgicalSim.CuttingV3
                 }
                 result = da >= 0f ? (va, va_dup) : (va_dup, va);
             }
-            else if (t >= 1f - 1e-4f)
+            else if (t >= 1f - 1e-4f || Mathf.Abs(db) <= 1.05e-4f)
             {
                 // 同理，snap 到 vb 时也必须复用同一克隆
                 if (!_frameSnapCache.TryGetValue(vb, out int vb_dup))
@@ -465,7 +479,7 @@ namespace SurgicalSim.CuttingV3
         }
 
         // ══════════════════════════════════════════════════════
-        public int RemoveStretchedTets(float maxStretchRatio = 5.0f, float minAbsoluteLength = 0.02f)
+        public int RemoveStretchedTets(float maxStretchRatio = 5.0f, float minAbsoluteLength = 0.003f)
         {
             if (_data == null) return 0;
             int removedCount = 0;
@@ -495,16 +509,19 @@ namespace SurgicalSim.CuttingV3
 
                 bool isStretched = false;
                 
-                // Check if the edge is both highly stretched AND physically very long
                 bool CheckEdge(Vector3 cpA, Vector3 cpB, Vector3 crA, Vector3 crB)
                 {
                     float currentSqr = (cpA - cpB).sqrMagnitude;
-                    if (currentSqr < sqrMinLen) return false; // Ignore short edges (prevents eroding the surface slivers)
-                    
                     float restSqr = (crA - crB).sqrMagnitude;
-                    if (restSqr < 1e-12f) return true; // Zero rest length but current length > minLen (degenerate stretched)
                     
-                    return (currentSqr / restSqr) > sqrMaxRatio;
+                    if (restSqr < 1e-12f) return currentSqr > sqrMinLen; // Zero rest length but stretched
+                    
+                    float ratio = currentSqr / restSqr;
+                    // 如果拉伸超过 10 倍（平方100倍），不管它多短，绝对是拓扑错误（藕断丝连），必须斩断！
+                    if (ratio > 100.0f) return true; 
+                    
+                    if (currentSqr < sqrMinLen) return false; // Ignore short edges
+                    return ratio > sqrMaxRatio;
                 }
 
                 if (CheckEdge(p0, p1, r0, r1)) isStretched = true;
@@ -544,26 +561,33 @@ namespace SurgicalSim.CuttingV3
         // ══════════════════════════════════════════════════════
         // 跨帧拓扑一致性锁定
         // ══════════════════════════════════════════════════════
-        float EnforceConsistentSide(int vid, float d)
+        float EnforceConsistentSide(int vid, float d, Vector3 currentNormal)
         {
             if (vid >= _strokeStartVertCount) return d; // 仅对原始顶点生效
             
             int currentSide = d >= 0f ? 1 : -1;
             
-            if (_strokeVertexSide.TryGetValue(vid, out int lockedSide))
+            if (_strokeVertexSide.TryGetValue(vid, out var locked))
             {
-                if (currentSide != lockedSide)
+                // 如果平面发生了显著旋转（>25度，cos(25)≈0.9），则旧的锁定失效，更新为新平面的锁定
+                if (Vector3.Dot(locked.normal, currentNormal) < 0.9f)
+                {
+                    _strokeVertexSide[vid] = new VertexSideLock { side = currentSide, normal = currentNormal };
+                    return d;
+                }
+
+                if (currentSide != locked.side)
                 {
                     // 发生了跨帧侧翻转！强制拉回锁定侧
                     // 锁为正侧(1) -> 设为 0f，这会被后续 Trajectory Correction 识别并吸附到 0f (保持正侧)
                     // 锁为负侧(-1) -> 设为 -1.01e-4f，恰好大于 SNAP_DIST，保证它严格是负的并且极靠近切面
-                    return lockedSide > 0 ? 0f : -1.01e-4f;
+                    return locked.side > 0 ? 0f : -1.01e-4f;
                 }
             }
             else
             {
-                // 首次在切面附近评估该顶点，记录其初始拓扑侧
-                _strokeVertexSide[vid] = currentSide;
+                // 首次在切面附近评估该顶点，记录其初始拓扑侧和法线
+                _strokeVertexSide[vid] = new VertexSideLock { side = currentSide, normal = currentNormal };
             }
             return d;
         }
