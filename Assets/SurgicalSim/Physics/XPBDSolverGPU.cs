@@ -25,12 +25,14 @@ namespace SurgicalSim.Physics
         // ── GPU 资源 ─────────────────────────────────────────
         readonly ComputeShader _cs;
         int _kIntegrate, _kSolveEdges, _kSolveNHDev, _kSolveNHHyd,
-            _kPostSolve, _kGroundCollision;
+            _kPostSolve, _kGroundCollision, _kToolCollision,
+            _kSolveSurfaceToolContacts;
 
         ComputeBuffer _bufPos, _bufPrevPos, _bufVel, _bufInvMass;
         ComputeBuffer _bufTetIds, _bufRestVol, _bufTetActive;
         ComputeBuffer _bufEdgeIds, _bufRestLen, _bufEdgeActive;
         ComputeBuffer _bufColorFlat, _bufEdgeColorFlat;
+        ComputeBuffer _bufSurfaceTriIds, _bufSurfaceTriColorFlat;
         // NeoHookean 专用
         ComputeBuffer _bufInvRestMatrix;    // float4[numT*3]
         ComputeBuffer _bufAlphaDeviatoric;  // float[numT]
@@ -39,11 +41,16 @@ namespace SurgicalSim.Physics
         int[] _groupOff, _groupCnt; int _numColors;
         int[] _edgeGroupOff, _edgeGroupCnt; int _numEdgeColors;
 
-        int _numP, _numT, _numE;
+        int _numP, _numT, _numE, _numSurfaceTris;
         const int TH = 64;
         Vector4[] _readBuf;
 
         List<int>[] _edgeToTets;
+        int[] _surfaceGroupOff, _surfaceGroupCnt; int _numSurfaceColors;
+
+        public float ToolContactDistance = 0.01f;
+        public float ToolContactCompliance = 1e-7f;
+        public int ToolContactIterations = 2;
 
         [System.Runtime.InteropServices.StructLayout(
             System.Runtime.InteropServices.LayoutKind.Sequential)]
@@ -51,6 +58,9 @@ namespace SurgicalSim.Physics
         [System.Runtime.InteropServices.StructLayout(
             System.Runtime.InteropServices.LayoutKind.Sequential)]
         struct UInt2 { public uint x, y; }
+        [System.Runtime.InteropServices.StructLayout(
+            System.Runtime.InteropServices.LayoutKind.Sequential)]
+        struct UInt3 { public uint x, y, z; }
 
         public XPBDSolverGPU(ComputeShader cs)
         {
@@ -61,6 +71,8 @@ namespace SurgicalSim.Physics
             _kSolveNHHyd     = _cs.FindKernel("CSSolveNeoHookeanHyd");
             _kPostSolve      = _cs.FindKernel("CSPostSolve");
             _kGroundCollision = _cs.FindKernel("CSGroundCollision");
+            _kToolCollision   = _cs.FindKernel("CSToolCollision");
+            _kSolveSurfaceToolContacts = _cs.FindKernel("CSSolveSurfaceToolContacts");
         }
 
         // ══════════════════════════════════════════════════════
@@ -71,6 +83,7 @@ namespace SurgicalSim.Physics
         {
             _numP = data.NumParticles;
             _numT = data.NumTets;
+            _numSurfaceTris = data.NumSurfaceTris;
 
             // Lamé 参数
             float E = YoungsModulus;
@@ -187,6 +200,9 @@ namespace SurgicalSim.Physics
             BuildEdgeColorGroups(edgeIds, _numE, _numP,
                 out int[] edgeColorFlat,
                 out _edgeGroupOff, out _edgeGroupCnt, out _numEdgeColors);
+            BuildSurfaceTriColorGroups(data.SurfaceTriIds, _numSurfaceTris, _numP,
+                out int[] surfaceTriColorFlat,
+                out _surfaceGroupOff, out _surfaceGroupCnt, out _numSurfaceColors);
 
             // ── 上传 GPU Buffer ──────────────────────────────
             _bufPos      = MkV4(ToV4(curPos, _numP));
@@ -213,6 +229,11 @@ namespace SurgicalSim.Physics
 
             _bufColorFlat     = MkI(colorFlat);
             _bufEdgeColorFlat = MkI(edgeColorFlat);
+            if (_numSurfaceTris > 0)
+            {
+                _bufSurfaceTriIds = MkU3(ToU3(data.SurfaceTriIds, _numSurfaceTris));
+                _bufSurfaceTriColorFlat = MkI(surfaceTriColorFlat);
+            }
 
             _readBuf = new Vector4[_numP];
             BindAll();
@@ -251,8 +272,8 @@ namespace SurgicalSim.Physics
                 maxBnorm = Mathf.Max(maxBnorm, bn);
             }
 
-            Debug.Log($"[XPBDSolverGPU] NeoHookean Init | P:{_numP} T:{_numT} E:{_numE} | " +
-                      $"Colors:{_numColors} EdgeColors:{_numEdgeColors}");
+            Debug.Log($"[XPBDSolverGPU] NeoHookean Init | P:{_numP} T:{_numT} E:{_numE} SurfaceTris:{_numSurfaceTris} | " +
+                      $"Colors:{_numColors} EdgeColors:{_numEdgeColors} SurfaceColors:{_numSurfaceColors}");
             Debug.Log($"[XPBDSolverGPU] Lamé: λ={_lameLambda:G4} μ={_lameMu:G4} | " +
                       $"E={YoungsModulus:G4} ν={PoissonsRatio}");
             Debug.Log($"[XPBDSolverGPU] InvMass: [{minInvM:G4}, {maxInvM:G4}] | " +
@@ -268,6 +289,9 @@ namespace SurgicalSim.Physics
         // ══════════════════════════════════════════════════════
         public void Step(float dt)
         {
+            if (_bufPos == null || _bufInvMass == null) return;
+            BindAll();
+
             float sdt = dt / NumSubSteps;
             float sdt2 = sdt * sdt;
 
@@ -282,6 +306,9 @@ namespace SurgicalSim.Physics
             _cs.SetInt("_NumParticles", _numP);
             _cs.SetInt("_NumTets",      _numT);
             _cs.SetInt("_NumEdges",     _numE);
+            _cs.SetInt("_NumSurfaceTris", _numSurfaceTris);
+            _cs.SetFloat("_ToolContactDistance", ToolContactDistance);
+            _cs.SetFloat("_ToolContactAlpha", ToolContactCompliance / sdt2);
 
             // GS (图着色) 比 Jacobi 收敛快得多
             // FantasyVR 用 Jacobi 需要 10 次, GS 只需 1 次
@@ -313,10 +340,17 @@ namespace SurgicalSim.Physics
                     }
                 }
 
-                // 3. 地面碰撞
+                // 3. 夹爪碰撞（第一次 — 弹性约束后）
+                SolveToolContacts();
+
+                // 4. 地面碰撞
                 Go(_kGroundCollision, _numP);
 
-                // 4. 更新速度 + 阻尼
+                // 5. 内部约束扩散接触位移，然后最终再投影一次接触，避免弹性约束把表面拉回工具内
+                SolveInternalOnce();
+                SolveToolContacts();
+
+                // 6. 更新速度 + 阻尼
                 Go(_kPostSolve, _numP);
             }
         }
@@ -324,6 +358,42 @@ namespace SurgicalSim.Physics
         // ══════════════════════════════════════════════════════
         // 读回位置
         // ══════════════════════════════════════════════════════
+        void SolveInternalOnce()
+        {
+            for (int c = 0; c < _numEdgeColors; c++)
+            {
+                _cs.SetInt("_GroupOffset", _edgeGroupOff[c]);
+                _cs.SetInt("_GroupCount",  _edgeGroupCnt[c]);
+                Go(_kSolveEdges, _edgeGroupCnt[c]);
+            }
+
+            for (int c = 0; c < _numColors; c++)
+            {
+                _cs.SetInt("_GroupOffset", _groupOff[c]);
+                _cs.SetInt("_GroupCount",  _groupCnt[c]);
+                Go(_kSolveNHDev, _groupCnt[c]);
+                Go(_kSolveNHHyd, _groupCnt[c]);
+            }
+        }
+
+        void SolveToolContacts()
+        {
+            if (_numSurfaceTris <= 0 || _numSurfaceColors <= 0 ||
+                _bufSurfaceTriIds == null || _bufSurfaceTriColorFlat == null)
+                return;
+
+            int iterations = Mathf.Max(1, ToolContactIterations);
+            for (int iter = 0; iter < iterations; iter++)
+            {
+                for (int c = 0; c < _numSurfaceColors; c++)
+                {
+                    _cs.SetInt("_SurfaceGroupOffset", _surfaceGroupOff[c]);
+                    _cs.SetInt("_SurfaceGroupCount",  _surfaceGroupCnt[c]);
+                    Go(_kSolveSurfaceToolContacts, _surfaceGroupCnt[c]);
+                }
+            }
+        }
+
         public void ReadbackPositions(Core.TetMeshData data)
         {
             _bufPos.GetData(_readBuf);
@@ -367,6 +437,41 @@ namespace SurgicalSim.Physics
 
         public ComputeBuffer GetPositionsBuffer() => _bufPos;
 
+        /// <summary>
+        /// 上传 InvMass 到 GPU（用于夹取时锁定/解锁粒子）
+        /// 将 data.InvMass 直接写入 GPU buffer，无需完整 Dispose+Init
+        /// </summary>
+        public void UploadInvMass(Core.TetMeshData data)
+        {
+            if (_bufInvMass == null) return;
+            var invM = new float[_numP];
+            int count = Mathf.Min(_numP, data.NumParticles);
+            for (int i = 0; i < count; i++)
+                invM[i] = data.InvMass[i];
+            _bufInvMass.SetData(invM);
+        }
+
+        /// <summary>
+        /// 设置胶囊体碰撞参数（每帧调用，在 Step 之前）
+        /// 3个胶囊体: 上颚 + 下颚 + 杆身
+        /// 参考 SOFA collision pipeline
+        /// </summary>
+        public void SetCapsuleCollisionParams(
+            Vector3 cap0A, Vector3 cap0B, float cap0R,
+            Vector3 cap1A, Vector3 cap1B, float cap1R,
+            Vector3 cap2A, Vector3 cap2B, float cap2R,
+            int numCapsules)
+        {
+            _cs.SetVector("_Capsule0A", new Vector4(cap0A.x, cap0A.y, cap0A.z, cap0R));
+            _cs.SetVector("_Capsule0B", new Vector4(cap0B.x, cap0B.y, cap0B.z, 0f));
+            _cs.SetVector("_Capsule1A", new Vector4(cap1A.x, cap1A.y, cap1A.z, cap1R));
+            _cs.SetVector("_Capsule1B", new Vector4(cap1B.x, cap1B.y, cap1B.z, 0f));
+            _cs.SetVector("_Capsule2A", new Vector4(cap2A.x, cap2A.y, cap2A.z, cap2R));
+            _cs.SetVector("_Capsule2B", new Vector4(cap2B.x, cap2B.y, cap2B.z, 0f));
+            _cs.SetVector("_ToolBBoxMin", Vector4.zero);
+            _cs.SetVector("_ToolBBoxMax", new Vector4(0f, 0f, 0f, numCapsules));
+        }
+
         public void UploadTetActiveBuffer(bool[] ta)
         {
             var a = new int[_numT];
@@ -408,6 +513,7 @@ namespace SurgicalSim.Physics
             _bufTetActive?.Release(); _bufEdgeIds?.Release(); _bufRestLen?.Release();
             _bufEdgeActive?.Release();
             _bufColorFlat?.Release(); _bufEdgeColorFlat?.Release();
+            _bufSurfaceTriIds?.Release(); _bufSurfaceTriColorFlat?.Release();
             _bufInvRestMatrix?.Release();
             _bufAlphaDeviatoric?.Release(); _bufAlphaHydrostatic?.Release();
         }
@@ -497,6 +603,20 @@ namespace SurgicalSim.Physics
                 _cs.SetBuffer(k, "_InvRestMatrix",    _bufInvRestMatrix);
                 _cs.SetBuffer(k, "_AlphaDeviatoric",  _bufAlphaDeviatoric);
                 _cs.SetBuffer(k, "_AlphaHydrostatic", _bufAlphaHydrostatic);
+            }
+
+            // Tool collision — 需要 _Positions, _PrevPositions(速度修正), _InvMasses
+            _cs.SetBuffer(_kToolCollision, "_Positions", _bufPos);
+            _cs.SetBuffer(_kToolCollision, "_PrevPositions", _bufPrevPos);
+            _cs.SetBuffer(_kToolCollision, "_InvMasses", _bufInvMass);
+
+            if (_bufSurfaceTriIds != null && _bufSurfaceTriColorFlat != null)
+            {
+                _cs.SetBuffer(_kSolveSurfaceToolContacts, "_Positions", _bufPos);
+                _cs.SetBuffer(_kSolveSurfaceToolContacts, "_PrevPositions", _bufPrevPos);
+                _cs.SetBuffer(_kSolveSurfaceToolContacts, "_InvMasses", _bufInvMass);
+                _cs.SetBuffer(_kSolveSurfaceToolContacts, "_SurfaceTriIds", _bufSurfaceTriIds);
+                _cs.SetBuffer(_kSolveSurfaceToolContacts, "_SurfaceTriColorGroupFlat", _bufSurfaceTriColorFlat);
             }
         }
 
@@ -602,11 +722,72 @@ namespace SurgicalSim.Physics
         }
 
         // ── Buffer helpers ──────────────────────────────────
+        void BuildSurfaceTriColorGroups(int[] triIds, int numTris, int numParticles,
+            out int[] flat, out int[] offsets, out int[] counts, out int numColors)
+        {
+            if (triIds == null || numTris <= 0)
+            {
+                flat = Array.Empty<int>();
+                offsets = Array.Empty<int>();
+                counts = Array.Empty<int>();
+                numColors = 0;
+                return;
+            }
+
+            int[] color = new int[numTris];
+            Array.Fill(color, -1);
+            var vertToTris = new List<int>[numParticles];
+            for (int i = 0; i < numParticles; i++) vertToTris[i] = new List<int>(8);
+
+            for (int t = 0; t < numTris; t++)
+            {
+                vertToTris[triIds[t * 3 + 0]].Add(t);
+                vertToTris[triIds[t * 3 + 1]].Add(t);
+                vertToTris[triIds[t * 3 + 2]].Add(t);
+            }
+
+            int maxColor = 0;
+            for (int t = 0; t < numTris; t++)
+            {
+                int a = triIds[t * 3 + 0];
+                int b = triIds[t * 3 + 1];
+                int c = triIds[t * 3 + 2];
+                var used = new HashSet<int>();
+                foreach (int n in vertToTris[a]) if (color[n] >= 0) used.Add(color[n]);
+                foreach (int n in vertToTris[b]) if (color[n] >= 0) used.Add(color[n]);
+                foreach (int n in vertToTris[c]) if (color[n] >= 0) used.Add(color[n]);
+                int chosen = 0; while (used.Contains(chosen)) chosen++;
+                color[t] = chosen;
+                if (chosen > maxColor) maxColor = chosen;
+            }
+
+            numColors = maxColor + 1;
+            var groups = new List<int>[numColors];
+            for (int i = 0; i < numColors; i++) groups[i] = new List<int>();
+            for (int t = 0; t < numTris; t++) groups[color[t]].Add(t);
+
+            offsets = new int[numColors];
+            counts = new int[numColors];
+            int total = 0;
+            for (int i = 0; i < numColors; i++) total += groups[i].Count;
+            flat = new int[total];
+
+            int off = 0;
+            for (int i = 0; i < numColors; i++)
+            {
+                offsets[i] = off;
+                counts[i] = groups[i].Count;
+                groups[i].CopyTo(flat, off);
+                off += groups[i].Count;
+            }
+        }
+
         ComputeBuffer MkV4(Vector4[] d) { var b=new ComputeBuffer(d.Length,16); b.SetData(d); return b; }
         ComputeBuffer MkF(float[] d)    { var b=new ComputeBuffer(d.Length,4);  b.SetData(d); return b; }
         ComputeBuffer MkI(int[] d)      { var b=new ComputeBuffer(d.Length,4);  b.SetData(d); return b; }
         ComputeBuffer MkU4(UInt4[] d)   { var b=new ComputeBuffer(d.Length,16); b.SetData(d); return b; }
         ComputeBuffer MkU2(UInt2[] d)   { var b=new ComputeBuffer(d.Length,8);  b.SetData(d); return b; }
+        ComputeBuffer MkU3(UInt3[] d)   { var b=new ComputeBuffer(d.Length,12); b.SetData(d); return b; }
 
         static Vector4[] ToV4(Vector3[] v, int count) {
             var r=new Vector4[count];
@@ -621,6 +802,11 @@ namespace SurgicalSim.Physics
         static UInt2[] ToU2(int[] f,int n) {
             var a=new UInt2[n];
             for(int i=0;i<n;i++) a[i]=new UInt2{x=(uint)f[i*2],y=(uint)f[i*2+1]};
+            return a;
+        }
+        static UInt3[] ToU3(int[] f,int n) {
+            var a=new UInt3[n];
+            for(int i=0;i<n;i++) a[i]=new UInt3{x=(uint)f[i*3],y=(uint)f[i*3+1],z=(uint)f[i*3+2]};
             return a;
         }
     }

@@ -9,6 +9,8 @@
 #pragma kernel CSSolveNeoHookeanHyd
 #pragma kernel CSPostSolve
 #pragma kernel CSGroundCollision
+#pragma kernel CSToolCollision
+#pragma kernel CSSolveSurfaceToolContacts
 
 // ═══════════════════════════════════════════════════════
 // Uniforms
@@ -17,17 +19,33 @@ float  _Dt;
 float  _GravityX, _GravityY, _GravityZ;
 float  _EdgeAlpha;       // edgeCompliance / (dt*dt)
 float  _GroundY;
+float  _ToolContactDistance;
+float  _ToolContactAlpha;
+
+// Tool collision (Multi-Capsule SDF)
+float4 _Capsule0A;        // xyz=端点A, w=半径
+float4 _Capsule0B;        // xyz=端点B, w=unused
+float4 _Capsule1A;        // xyz=端点A, w=半径
+float4 _Capsule1B;        // xyz=端点B, w=unused
+float4 _Capsule2A;        // xyz=端点A (shaft), w=半径
+float4 _Capsule2B;        // xyz=端点B (shaft), w=unused
+float4 _ToolBBoxMin;      // xyz=AABB min
+float4 _ToolBBoxMax;      // xyz=AABB max, w=胶囊体数量 (0=off)
 float  _Damping;         // 速度阻尼 (0~1)
 float  _Omega;           // SOR 松弛因子 (0~1), 模拟 Jacobi 平均化效果
 uint   _NumParticles;
 uint   _NumTets;
 uint   _NumEdges;
+uint   _NumSurfaceTris;
 uint   _GroupOffset;      // Graph Coloring: 当前颜色组的起始偏移
 uint   _GroupCount;       // Graph Coloring: 当前颜色组的大小
 
 // ═══════════════════════════════════════════════════════
 // Buffers
 // ═══════════════════════════════════════════════════════
+uint   _SurfaceGroupOffset;
+uint   _SurfaceGroupCount;
+
 RWStructuredBuffer<float4> _Positions;
 RWStructuredBuffer<float4> _PrevPositions;
 RWStructuredBuffer<float4> _Velocities;
@@ -50,10 +68,13 @@ StructuredBuffer<float>    _RestLengths;
 StructuredBuffer<int>      _EdgeActive;
 StructuredBuffer<int>      _ColorGroupFlat;      // tet 颜色组
 StructuredBuffer<int>      _EdgeColorGroupFlat;   // edge 颜色组
+StructuredBuffer<uint3>    _SurfaceTriIds;
+StructuredBuffer<int>      _SurfaceTriColorGroupFlat;
 
 // ═══════════════════════════════════════════════════════
 // Helper functions
 // ═══════════════════════════════════════════════════════
+
 float det3x3(float3x3 M)
 {
     return M[0][0] * (M[1][1]*M[2][2] - M[1][2]*M[2][1])
@@ -322,4 +343,421 @@ void CSGroundCollision(uint3 id : SV_DispatchThreadID)
         prev.y = _GroundY;
         _Positions[i] = float4(prev, 0);
     }
+}
+
+// ═══════════════════════════════════════════════════════
+// Helper: Point-to-Capsule Signed Distance Field
+// ═══════════════════════════════════════════════════════
+float4 CapsuleSDF(float3 pos, float3 capA, float3 capB, float capR)
+{
+    float3 ab = capB - capA;
+    float ab2 = dot(ab, ab);
+    float t = (ab2 < 1e-10) ? 0.0 : saturate(dot(pos - capA, ab) / ab2);
+    float3 closest = capA + t * ab;
+    float3 diff = pos - closest;
+    float dist = length(diff);
+    float sdf = dist - capR;
+    float3 normal;
+    if (dist < 1e-8)
+    {
+        float3 abN = (ab2 < 1e-10) ? float3(0, 1, 0) : normalize(ab);
+        float3 perp = (abs(abN.x) < 0.9) ? float3(1, 0, 0) : float3(0, 1, 0);
+        normal = normalize(cross(abN, perp));
+    }
+    else
+    {
+        normal = diff / dist;
+    }
+    return float4(sdf, normal);
+}
+
+float3 ClosestPointOnSegment(float3 p, float3 a, float3 b, out float t)
+{
+    float3 ab = b - a;
+    float ab2 = dot(ab, ab);
+    t = (ab2 < 1e-10) ? 0.0 : saturate(dot(p - a, ab) / ab2);
+    return a + t * ab;
+}
+
+float3 ClosestPointOnTriangle(float3 p, float3 a, float3 b, float3 c, out float3 bary)
+{
+    float3 ab = b - a;
+    float3 ac = c - a;
+    float3 ap = p - a;
+    float d1 = dot(ab, ap);
+    float d2 = dot(ac, ap);
+    if (d1 <= 0.0 && d2 <= 0.0)
+    {
+        bary = float3(1.0, 0.0, 0.0);
+        return a;
+    }
+
+    float3 bp = p - b;
+    float d3 = dot(ab, bp);
+    float d4 = dot(ac, bp);
+    if (d3 >= 0.0 && d4 <= d3)
+    {
+        bary = float3(0.0, 1.0, 0.0);
+        return b;
+    }
+
+    float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0)
+    {
+        float v = d1 / (d1 - d3);
+        bary = float3(1.0 - v, v, 0.0);
+        return a + v * ab;
+    }
+
+    float3 cp = p - c;
+    float d5 = dot(ab, cp);
+    float d6 = dot(ac, cp);
+    if (d6 >= 0.0 && d5 <= d6)
+    {
+        bary = float3(0.0, 0.0, 1.0);
+        return c;
+    }
+
+    float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0)
+    {
+        float w = d2 / (d2 - d6);
+        bary = float3(1.0 - w, 0.0, w);
+        return a + w * ac;
+    }
+
+    float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0)
+    {
+        float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        bary = float3(0.0, 1.0 - w, w);
+        return b + w * (c - b);
+    }
+
+    float denom = 1.0 / (va + vb + vc);
+    float v2 = vb * denom;
+    float w2 = vc * denom;
+    bary = float3(1.0 - v2 - w2, v2, w2);
+    return bary.x * a + bary.y * b + bary.z * c;
+}
+
+void ClosestPtSegmentSegment(
+    float3 p1, float3 q1, float3 p2, float3 q2,
+    out float s, out float t, out float3 c1, out float3 c2)
+{
+    float3 d1 = q1 - p1;
+    float3 d2 = q2 - p2;
+    float3 r = p1 - p2;
+    float a = dot(d1, d1);
+    float e = dot(d2, d2);
+    float f = dot(d2, r);
+
+    if (a <= 1e-10 && e <= 1e-10)
+    {
+        s = 0.0;
+        t = 0.0;
+        c1 = p1;
+        c2 = p2;
+        return;
+    }
+
+    if (a <= 1e-10)
+    {
+        s = 0.0;
+        t = (e <= 1e-10) ? 0.0 : saturate(f / e);
+    }
+    else
+    {
+        float c = dot(d1, r);
+        if (e <= 1e-10)
+        {
+            t = 0.0;
+            s = saturate(-c / a);
+        }
+        else
+        {
+            float b = dot(d1, d2);
+            float denom = a * e - b * b;
+            s = (abs(denom) > 1e-10) ? saturate((b * f - c * e) / denom) : 0.0;
+
+            float tNom = b * s + f;
+            if (tNom < 0.0)
+            {
+                t = 0.0;
+                s = saturate(-c / a);
+            }
+            else if (tNom > e)
+            {
+                t = 1.0;
+                s = saturate((b - c) / a);
+            }
+            else
+            {
+                t = tNom / e;
+            }
+        }
+    }
+
+    c1 = p1 + d1 * s;
+    c2 = p2 + d2 * t;
+}
+
+bool SegmentTriangleIntersection(float3 p0, float3 p1, float3 a, float3 b, float3 c, out float3 bary)
+{
+    float3 d = p1 - p0;
+    float3 e1 = b - a;
+    float3 e2 = c - a;
+    float3 h = cross(d, e2);
+    float det = dot(e1, h);
+    if (abs(det) < 1e-8)
+    {
+        bary = float3(0.0, 0.0, 0.0);
+        return false;
+    }
+
+    float invDet = 1.0 / det;
+    float3 s = p0 - a;
+    float u = invDet * dot(s, h);
+    if (u < 0.0 || u > 1.0)
+    {
+        bary = float3(0.0, 0.0, 0.0);
+        return false;
+    }
+
+    float3 q = cross(s, e1);
+    float v = invDet * dot(d, q);
+    if (v < 0.0 || u + v > 1.0)
+    {
+        bary = float3(0.0, 0.0, 0.0);
+        return false;
+    }
+
+    float segT = invDet * dot(e2, q);
+    if (segT < 0.0 || segT > 1.0)
+    {
+        bary = float3(0.0, 0.0, 0.0);
+        return false;
+    }
+
+    bary = float3(1.0 - u - v, u, v);
+    return true;
+}
+
+void ConsiderTriCapsuleCandidate(
+    float3 triPoint, float3 capPoint, float3 bary, float capR, float3 fallbackNormal,
+    inout float bestC, inout float3 bestNormal, inout float3 bestBary)
+{
+    float3 delta = triPoint - capPoint;
+    float dist = length(delta);
+    float3 n = (dist > 1e-8) ? (delta / dist) : fallbackNormal;
+    float c = dist - capR - _ToolContactDistance;
+    if (c < bestC)
+    {
+        bestC = c;
+        bestNormal = n;
+        bestBary = bary;
+    }
+}
+
+void EvaluateTriCapsuleContact(
+    float3 a, float3 b, float3 c, float3 capA, float3 capB, float capR,
+    inout float bestC, inout float3 bestNormal, inout float3 bestBary)
+{
+    float shell = capR + _ToolContactDistance;
+    float3 triMin = min(a, min(b, c));
+    float3 triMax = max(a, max(b, c));
+    float3 capMin = min(capA, capB) - shell;
+    float3 capMax = max(capA, capB) + shell;
+    if (any(triMax < capMin) || any(triMin > capMax))
+        return;
+
+    float3 triN = cross(b - a, c - a);
+    float nLen = length(triN);
+    if (nLen < 1e-10)
+        return;
+
+    triN /= nLen;
+    float3 triCenter = (a + b + c) * (1.0 / 3.0);
+    float3 capMid = (capA + capB) * 0.5;
+    if (dot(triN, triCenter - capMid) < 0.0)
+        triN = -triN;
+
+    float3 bary;
+    if (SegmentTriangleIntersection(capA, capB, a, b, c, bary))
+    {
+        float3 p = bary.x * a + bary.y * b + bary.z * c;
+        ConsiderTriCapsuleCandidate(p, p, bary, capR, triN, bestC, bestNormal, bestBary);
+    }
+
+    float3 pt = ClosestPointOnTriangle(capA, a, b, c, bary);
+    ConsiderTriCapsuleCandidate(pt, capA, bary, capR, triN, bestC, bestNormal, bestBary);
+
+    pt = ClosestPointOnTriangle(capB, a, b, c, bary);
+    ConsiderTriCapsuleCandidate(pt, capB, bary, capR, triN, bestC, bestNormal, bestBary);
+
+    float segT;
+    float3 cp = ClosestPointOnSegment(a, capA, capB, segT);
+    ConsiderTriCapsuleCandidate(a, cp, float3(1.0, 0.0, 0.0), capR, triN, bestC, bestNormal, bestBary);
+
+    cp = ClosestPointOnSegment(b, capA, capB, segT);
+    ConsiderTriCapsuleCandidate(b, cp, float3(0.0, 1.0, 0.0), capR, triN, bestC, bestNormal, bestBary);
+
+    cp = ClosestPointOnSegment(c, capA, capB, segT);
+    ConsiderTriCapsuleCandidate(c, cp, float3(0.0, 0.0, 1.0), capR, triN, bestC, bestNormal, bestBary);
+
+    float sCap, sEdge;
+    float3 capPt, edgePt;
+    ClosestPtSegmentSegment(capA, capB, a, b, sCap, sEdge, capPt, edgePt);
+    ConsiderTriCapsuleCandidate(edgePt, capPt, float3(1.0 - sEdge, sEdge, 0.0), capR, triN, bestC, bestNormal, bestBary);
+
+    ClosestPtSegmentSegment(capA, capB, b, c, sCap, sEdge, capPt, edgePt);
+    ConsiderTriCapsuleCandidate(edgePt, capPt, float3(0.0, 1.0 - sEdge, sEdge), capR, triN, bestC, bestNormal, bestBary);
+
+    ClosestPtSegmentSegment(capA, capB, c, a, sCap, sEdge, capPt, edgePt);
+    ConsiderTriCapsuleCandidate(edgePt, capPt, float3(sEdge, 0.0, 1.0 - sEdge), capR, triN, bestC, bestNormal, bestBary);
+}
+
+[numthreads(64,1,1)]
+void CSSolveSurfaceToolContacts(uint3 id : SV_DispatchThreadID)
+{
+    uint li = id.x;
+    if (li >= _SurfaceGroupCount) return;
+
+    int numCapsules = (int)_ToolBBoxMax.w;
+    if (numCapsules <= 0) return;
+
+    uint triIdx = (uint)_SurfaceTriColorGroupFlat[_SurfaceGroupOffset + li];
+    if (triIdx >= _NumSurfaceTris) return;
+
+    uint3 ids = _SurfaceTriIds[triIdx];
+    float w0 = _InvMasses[ids.x];
+    float w1 = _InvMasses[ids.y];
+    float w2 = _InvMasses[ids.z];
+    if (w0 + w1 + w2 <= 0.0) return;
+
+    float3 p0 = _Positions[ids.x].xyz;
+    float3 p1 = _Positions[ids.y].xyz;
+    float3 p2 = _Positions[ids.z].xyz;
+
+    float bestC = 1e20;
+    float3 bestNormal = float3(0.0, 1.0, 0.0);
+    float3 bestBary = float3(0.0, 0.0, 0.0);
+
+    if (numCapsules >= 1)
+        EvaluateTriCapsuleContact(p0, p1, p2, _Capsule0A.xyz, _Capsule0B.xyz, _Capsule0A.w, bestC, bestNormal, bestBary);
+    if (numCapsules >= 2)
+        EvaluateTriCapsuleContact(p0, p1, p2, _Capsule1A.xyz, _Capsule1B.xyz, _Capsule1A.w, bestC, bestNormal, bestBary);
+    if (numCapsules >= 3)
+        EvaluateTriCapsuleContact(p0, p1, p2, _Capsule2A.xyz, _Capsule2B.xyz, _Capsule2A.w, bestC, bestNormal, bestBary);
+
+    if (bestC >= 0.0) return;
+
+    float b0 = bestBary.x;
+    float b1 = bestBary.y;
+    float b2 = bestBary.z;
+    float denom = w0 * b0 * b0 + w1 * b1 * b1 + w2 * b2 * b2;
+    if (denom <= 1e-12) return;
+
+    float dlambda = (-bestC) / (denom + max(_ToolContactAlpha, 0.0));
+    float3 dx = dlambda * bestNormal;
+
+    p0 += w0 * b0 * dx;
+    p1 += w1 * b1 * dx;
+    p2 += w2 * b2 * dx;
+
+    _Positions[ids.x] = float4(p0, 0.0);
+    _Positions[ids.y] = float4(p1, 0.0);
+    _Positions[ids.z] = float4(p2, 0.0);
+
+    float3 prev0 = _PrevPositions[ids.x].xyz;
+    float3 prev1 = _PrevPositions[ids.y].xyz;
+    float3 prev2 = _PrevPositions[ids.z].xyz;
+    float3 contactNow = b0 * p0 + b1 * p1 + b2 * p2;
+    float3 contactPrev = b0 * prev0 + b1 * prev1 + b2 * prev2;
+    float vn = dot(contactNow - contactPrev, bestNormal);
+
+    if (vn < 0.0)
+    {
+        float3 prevDx = vn * bestNormal;
+        prev0 += (w0 * b0 / denom) * prevDx;
+        prev1 += (w1 * b1 / denom) * prevDx;
+        prev2 += (w2 * b2 / denom) * prevDx;
+
+        _PrevPositions[ids.x] = float4(prev0, 0.0);
+        _PrevPositions[ids.y] = float4(prev1, 0.0);
+        _PrevPositions[ids.z] = float4(prev2, 0.0);
+    }
+}
+
+// ═══════════════════════════════════════════════════════
+// Kernel 6: 夹爪碰撞 — Multi-Capsule SDF 位置投影
+// 3个胶囊体: 0=上颚, 1=下颚, 2=杆身(shaft)
+// ★ 关键: 碰撞时同时修正 prevPos，消除向工具方向的速度
+//   否则下一子步粒子又冲回去 (SOFA contact velocity correction)
+// ═══════════════════════════════════════════════════════
+[numthreads(64,1,1)]
+void CSToolCollision(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _NumParticles) return;
+    if (_InvMasses[i] == 0.0) return;
+
+    int numCapsules = (int)_ToolBBoxMax.w;
+    if (numCapsules <= 0) return;
+
+    float3 pos = _Positions[i].xyz;
+    float3 prevPos = _PrevPositions[i].xyz;
+    bool collided = false;
+    float3 lastNormal = float3(0, 1, 0);
+
+    // Capsule 0 (上颚)
+    if (numCapsules >= 1)
+    {
+        float4 res = CapsuleSDF(pos, _Capsule0A.xyz, _Capsule0B.xyz, _Capsule0A.w);
+        if (res.x < 0.0)
+        {
+            pos -= res.x * res.yzw;
+            collided = true;
+            lastNormal = res.yzw;
+        }
+    }
+
+    // Capsule 1 (下颚)
+    if (numCapsules >= 2)
+    {
+        float4 res = CapsuleSDF(pos, _Capsule1A.xyz, _Capsule1B.xyz, _Capsule1A.w);
+        if (res.x < 0.0)
+        {
+            pos -= res.x * res.yzw;
+            collided = true;
+            lastNormal = res.yzw;
+        }
+    }
+
+    // Capsule 2 (杆身/shaft)
+    if (numCapsules >= 3)
+    {
+        float4 res = CapsuleSDF(pos, _Capsule2A.xyz, _Capsule2B.xyz, _Capsule2A.w);
+        if (res.x < 0.0)
+        {
+            pos -= res.x * res.yzw;
+            collided = true;
+            lastNormal = res.yzw;
+        }
+    }
+
+    if (collided)
+    {
+        // ★ 速度修正: 消除粒子向工具方向的速度分量
+        // 没有这一步，粒子会在下一子步又冲回胶囊体内
+        float3 vel = pos - prevPos;  // 位移 = 速度 * dt
+        float vn = dot(vel, lastNormal);
+        if (vn < 0.0)  // 粒子正在向工具移动
+        {
+            prevPos += vn * lastNormal;  // 取消这个方向的速度
+        }
+        _PrevPositions[i] = float4(prevPos, 0);
+    }
+
+    _Positions[i] = float4(pos, 0);
 }

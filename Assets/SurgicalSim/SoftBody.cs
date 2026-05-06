@@ -7,6 +7,7 @@ using SurgicalSim.Core;
 using SurgicalSim.Physics;
 using SurgicalSim.Cutting;
 using SurgicalSim.CuttingV3;
+using SurgicalSim.Grasping;
 
 namespace SurgicalSim
 {
@@ -61,6 +62,14 @@ namespace SurgicalSim
         public bool  createGroundPlane = true;
         public Color groundColor       = new Color(0.3f, 0.7f, 0.3f, 0.8f);
 
+        [Header("Tool Contact")]
+        [Range(0.001f, 0.08f)]
+        public float toolContactDistance = 0.01f;
+        [Range(0f, 1e-4f)]
+        public float toolContactCompliance = 1e-7f;
+        [Range(1, 8)]
+        public int toolContactIterations = 2;
+
         [Header("切割")]
         [Tooltip("啟用鼠標拖拽切割")]
         public bool enableCutting = true;
@@ -91,6 +100,7 @@ namespace SurgicalSim
         TetMeshData       _data;
         GameObject        _groundPlane;
         CuttingToolV3     _cuttingTool;
+        GripperTool       _gripperTool;
 
 
 
@@ -151,7 +161,10 @@ namespace SurgicalSim
                 Damping          = damping,
                 Density          = density,
                 Gravity          = enableGravity ? new Vector3(0f, gravityY, 0f) : Vector3.zero,
-                GroundY          = groundY
+                GroundY          = groundY,
+                ToolContactDistance = toolContactDistance,
+                ToolContactCompliance = toolContactCompliance,
+                ToolContactIterations = toolContactIterations
             };
             _gpuSolver.Init(data);
 
@@ -167,6 +180,12 @@ namespace SurgicalSim
                 _cuttingTool.cutRadius = cutRadius;
                 _cuttingTool.Init(data, _gpuSolver, _visualizer);
             }
+
+            // 初始化夹爪工具
+            _gripperTool = GetComponent<GripperTool>();
+            if (_gripperTool == null)
+                _gripperTool = gameObject.AddComponent<GripperTool>();
+            _gripperTool.Init(data, _gpuSolver, _visualizer);
 
             // 設置雙面渲染材質（切面內部顏色）
             SetupTwoSidedMaterial();
@@ -205,11 +224,23 @@ namespace SurgicalSim
                 if (_data.InvMass[i] > 0f) { diagIdx = i; break; }
             Vector3 posBefore = _data.Positions[diagIdx];
 
+
             _gpuSolver.NumSubSteps      = numSubSteps;
             _gpuSolver.EdgeCompliance   = edgeCompliance;
             _gpuSolver.Damping          = damping;
             _gpuSolver.Gravity          = enableGravity ? new Vector3(0f, gravityY, 0f) : Vector3.zero;
             _gpuSolver.GroundY          = groundY;
+            _gpuSolver.ToolContactDistance = toolContactDistance;
+            _gpuSolver.ToolContactCompliance = toolContactCompliance;
+            _gpuSolver.ToolContactIterations = toolContactIterations;
+
+            // ★ 夹爪碰撞: 在 Step 之前上传平面参数到 GPU
+            if (_gripperTool != null)
+            {
+                try { _gripperTool.UploadToolCollisionToGPU(); }
+                catch (System.Exception ex)
+                { Debug.LogError($"[SoftBody] UploadToolCollision 异常: {ex.Message}"); }
+            }
 
             try
             {
@@ -238,6 +269,14 @@ namespace SurgicalSim
             catch (System.Exception ex)
             {
                 Debug.LogError($"[SoftBody] 物理步異常（可能是拓撲變化中）: {ex.Message}");
+            }
+
+            // ★ 夹爪夹取逻辑：在 Readback 之后执行（仅处理粒子捕获/释放）
+            if (_gripperTool != null)
+            {
+                try { _gripperTool.PhysicsStep(); }
+                catch (System.Exception ex)
+                { Debug.LogError($"[SoftBody] GripperTool PhysicsStep 异常: {ex.Message}"); }
             }
 
             _simTime += Time.fixedDeltaTime;
@@ -442,6 +481,10 @@ namespace SurgicalSim
             // 重新初始化切割工具
             if (_cuttingTool != null)
                 _cuttingTool.Init(_data, _gpuSolver, _visualizer);  // V3 reinit
+
+            // 重新初始化夹爪工具
+            if (_gripperTool != null)
+                _gripperTool.Init(_data, _gpuSolver, _visualizer);
 
             // 恢复原始表面三角形
             var mf = _visualizer.GetComponent<MeshFilter>();
