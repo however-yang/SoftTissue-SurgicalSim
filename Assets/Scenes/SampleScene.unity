@@ -282,6 +282,7 @@ GameObject:
   - component: {fileID: 442221606}
   - component: {fileID: 442221611}
   - component: {fileID: 442221612}
+  - component: {fileID: 442221613}
   m_Layer: 0
   m_Name: SoftBody
   m_TagString: Untagged
@@ -402,11 +403,11 @@ MonoBehaviour:
   edgeCompliance: 0.00001
   youngsModulus: 3000
   poissonsRatio: 0.257
-  damping: 0
+  damping: 0.044
   density: 1000
   enableGravity: 1
   gravityY: -9.81
-  pinAboveY: 1
+  pinAboveY: 2
   pinTopVertices: 1
   hangVertically: 1
   hangGroundY: -3
@@ -416,7 +417,7 @@ MonoBehaviour:
   enableCutting: 1
   cutRadius: 0.0047
   virtualBladeRadius: 0.0025
-  interiorColor: {r: 0.85, g: 0.45, b: 0.45, a: 1}
+  interiorColor: {r: 0.21960784, g: 0.21960784, b: 0.21960784, a: 1}
   liverColor: {r: 0.85, g: 0.25, b: 0.15, a: 1}
   pausePhysics: 0
   showStats: 1
@@ -434,6 +435,24 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   sampleEveryNFrames: 5
   alwaysSampleFirstNFrames: 20
+--- !u!114 &442221613
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 442221604}
+  m_Enabled: 0
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 3df37106cde7ed141870ed26b1e31fb4, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  surgicalTool: {fileID: 0}
+  forwardClearance: 0.35
+  cutSpeed: 0.12
+  segmentLength: 0.45
+  settleFrames: 30
+  pauseBetweenSegments: 0.25
 --- !u!1 &653260035
 GameObject:
   m_ObjectHideFlags: 0

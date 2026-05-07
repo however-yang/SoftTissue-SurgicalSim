@@ -5,6 +5,7 @@
 // Phase 2+ : 動態更新（物理求解後調用 Refresh()）
 
 using UnityEngine;
+using System.Collections.Generic;
 using SurgicalSim.Core;
 
 namespace SurgicalSim.Core
@@ -33,6 +34,8 @@ namespace SurgicalSim.Core
         // 頂點緩存（避免每幀 GC）
         Vector3[] _surfaceVerts;
         Vector3[] _surfaceNormals;
+        Vector2[] _surfaceUVs;
+        Vector3[] _surfaceRestPositions;
 
         TetMeshData _data;
         bool        _initialized = false;
@@ -99,6 +102,9 @@ namespace SurgicalSim.Core
 
             _surfaceMesh.vertices  = _surfaceVerts;
             _surfaceMesh.triangles = data.SurfaceTriIds;
+            _surfaceUVs = BuildPlanarUVs(data.Positions, data.NumParticles);
+            _surfaceMesh.uv = _surfaceUVs;
+            EnsureRestPositionUVs();
             _surfaceMesh.RecalculateNormals();
             _surfaceMesh.RecalculateBounds();
 
@@ -140,9 +146,12 @@ namespace SurgicalSim.Core
             {
                 _surfaceVerts   = new Vector3[_data.NumParticles];
                 _surfaceNormals = new Vector3[_data.NumParticles];
+                _surfaceUVs     = BuildPlanarUVs(_data.Positions, _data.NumParticles);
                 _surfaceMesh.indexFormat = _data.NumParticles > 65535
                     ? UnityEngine.Rendering.IndexFormat.UInt32
                     : UnityEngine.Rendering.IndexFormat.UInt16;
+                _surfaceMesh.uv = _surfaceUVs;
+                EnsureRestPositionUVs();
             }
 
             // 只拷贝有效的粒子数
@@ -166,6 +175,7 @@ namespace SurgicalSim.Core
             {
                 _surfaceVerts   = new Vector3[_data.NumParticles];
                 _surfaceNormals = new Vector3[_data.NumParticles];
+                _surfaceUVs     = BuildPlanarUVs(_data.Positions, _data.NumParticles);
             }
 
             // 复制所有粒子位置
@@ -177,11 +187,87 @@ namespace SurgicalSim.Core
                 ? UnityEngine.Rendering.IndexFormat.UInt32
                 : UnityEngine.Rendering.IndexFormat.UInt16;
             _surfaceMesh.SetVertices(_surfaceVerts, 0, _data.NumParticles);
+            if (_surfaceUVs == null || _surfaceUVs.Length != _data.NumParticles)
+                _surfaceUVs = BuildPlanarUVs(_data.Positions, _data.NumParticles);
+            _surfaceMesh.uv = _surfaceUVs;
+            EnsureRestPositionUVs();
             _surfaceMesh.triangles = newTriangles;
             _surfaceMesh.RecalculateNormals();
             _surfaceMesh.RecalculateBounds();
 
             Debug.Log($"[Visualizer] RebuildTopology: V={_data.NumParticles} T={newTriangles.Length/3}");
+        }
+
+        void EnsureRestPositionUVs()
+        {
+            if (_data == null || _surfaceMesh == null) return;
+
+            int count = _data.NumParticles;
+            if (_surfaceRestPositions == null || _surfaceRestPositions.Length != count)
+            {
+                Vector3[] old = _surfaceRestPositions;
+                _surfaceRestPositions = new Vector3[count];
+
+                int copied = old == null ? 0 : Mathf.Min(old.Length, count);
+                for (int i = 0; i < copied; i++)
+                    _surfaceRestPositions[i] = old[i];
+                for (int i = copied; i < count; i++)
+                    _surfaceRestPositions[i] = _data.Positions[i];
+            }
+
+            _surfaceMesh.SetUVs(1, new List<Vector3>(_surfaceRestPositions));
+        }
+
+        static Vector2[] BuildPlanarUVs(Vector3[] positions, int count)
+        {
+            var uvs = new Vector2[count];
+            if (positions == null || count <= 0) return uvs;
+
+            Vector3 min = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
+            Vector3 max = new Vector3(float.MinValue, float.MinValue, float.MinValue);
+            for (int i = 0; i < count; i++)
+            {
+                min = Vector3.Min(min, positions[i]);
+                max = Vector3.Max(max, positions[i]);
+            }
+
+            Vector3 size = max - min;
+            int uAxis = 0;
+            int vAxis = 1;
+            if (size.x >= size.y && size.x >= size.z)
+            {
+                uAxis = 0;
+                vAxis = size.y >= size.z ? 1 : 2;
+            }
+            else if (size.y >= size.x && size.y >= size.z)
+            {
+                uAxis = 1;
+                vAxis = size.x >= size.z ? 0 : 2;
+            }
+            else
+            {
+                uAxis = 2;
+                vAxis = size.x >= size.y ? 0 : 1;
+            }
+
+            float uMin = Axis(min, uAxis);
+            float vMin = Axis(min, vAxis);
+            float uSize = Mathf.Max(Axis(size, uAxis), 1e-6f);
+            float vSize = Mathf.Max(Axis(size, vAxis), 1e-6f);
+
+            for (int i = 0; i < count; i++)
+            {
+                float u = (Axis(positions[i], uAxis) - uMin) / uSize;
+                float v = (Axis(positions[i], vAxis) - vMin) / vSize;
+                uvs[i] = new Vector2(u, v);
+            }
+
+            return uvs;
+        }
+
+        static float Axis(Vector3 v, int axis)
+        {
+            return axis == 0 ? v.x : (axis == 1 ? v.y : v.z);
         }
 
         // ── Gizmos（Debug 用）────────────────────────────────

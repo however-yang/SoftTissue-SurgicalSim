@@ -23,6 +23,7 @@ namespace SurgicalSim.Grasping
         public string shaftVisual   = "Haptic_grasper_shaft.obj";
         public string jawUpCol      = "Haptic_grasper_jaws_up_collision.obj";
         public string jawDownCol    = "Haptic_grasper_jaws_down_collision.obj";
+        public string shaftCol      = "Haptic_grasper_shaft_collision.obj";
 
         [Header("模型参数")]
         [Tooltip("OBJ 单位到世界单位的缩放 (默认放大3倍: 0.003)")]
@@ -74,8 +75,8 @@ namespace SurgicalSim.Grasping
         GameObject _jawUpObj, _jawDownObj, _shaftObj;
 
         // 碰撞网格数据 (本地坐标，已缩放)
-        Vector3[] _colVertsUp, _colVertsDown;
-        int[]     _colTrisUp,  _colTrisDown;
+        Vector3[] _colVertsUp, _colVertsDown, _colVertsShaft;
+        int[]     _colTrisUp,  _colTrisDown,  _colTrisShaft;
 
         // 铰接参数 (从模型推断)
         // 上下颚绕 Z 轴方向的铰接点旋转
@@ -87,6 +88,8 @@ namespace SurgicalSim.Grasping
         Vector3 _dbgCap0A, _dbgCap0B, _dbgCap1A, _dbgCap1B;
         float   _dbgCapR;
         Vector3 _dbgBBoxMin, _dbgBBoxMax;
+        bool _hasPrevCapsules;
+        Vector3 _prevCap0A, _prevCap0B, _prevCap1A, _prevCap1B, _prevCap2A, _prevCap2B;
 
         // 夹取状态
         struct GraspedParticle
@@ -119,8 +122,10 @@ namespace SurgicalSim.Grasping
             // 夹爪尖端 (OBJ 坐标 → 缩放后)
             _tipLocal = new Vector3(0f, 9.0f, -43.0f) * modelScale;
             // 杆身尾端 (手柄方向，延伸足够长以覆盖整个杆身)
-            _shaftEndLocal = new Vector3(0f, 9.0f, 50.0f) * modelScale;
+            _shaftEndLocal = new Vector3(0f, 9.0f, 307.0f) * modelScale;
+            _shaftTipLocal = _pivotLocal;
             _prevToolPos = _toolPos;
+            _hasPrevCapsules = false;
 
             LoadModels();
             LoadCollisionMeshes();
@@ -213,6 +218,8 @@ namespace SurgicalSim.Grasping
         Vector3 _prevToolPos;
         Vector3 _shaftEndLocal; // 杆身尾端(手柄方向)
 
+        Vector3 _shaftTipLocal; // shaft tip/hinge end in scaled OBJ local space
+
         public void UploadToolCollisionToGPU()
         {
             if (!_initialized || _solver == null) return;
@@ -234,12 +241,22 @@ namespace SurgicalSim.Grasping
             // ── Capsule 2: 杆身 (shaft) ──
             // 从杆身尾端到铰接点，不随开合角度旋转
             Vector3 cap2A = toolRot * _shaftEndLocal + _toolPos;
-            Vector3 cap2B = toolRot * _pivotLocal + _toolPos;
+            Vector3 cap2B = toolRot * _shaftTipLocal + _toolPos;
+
+            Vector3 prevCap0A = _hasPrevCapsules ? _prevCap0A : cap0A;
+            Vector3 prevCap0B = _hasPrevCapsules ? _prevCap0B : cap0B;
+            Vector3 prevCap1A = _hasPrevCapsules ? _prevCap1A : cap1A;
+            Vector3 prevCap1B = _hasPrevCapsules ? _prevCap1B : cap1B;
+            Vector3 prevCap2A = _hasPrevCapsules ? _prevCap2A : cap2A;
+            Vector3 prevCap2B = _hasPrevCapsules ? _prevCap2B : cap2B;
 
             _solver.SetCapsuleCollisionParams(
                 cap0A, cap0B, capsuleRadius,
                 cap1A, cap1B, capsuleRadius,
                 cap2A, cap2B, shaftRadius,
+                prevCap0A, prevCap0B,
+                prevCap1A, prevCap1B,
+                prevCap2A, prevCap2B,
                 3);
 
             // Gizmo
@@ -257,6 +274,10 @@ namespace SurgicalSim.Grasping
                     $"Shaft=[{cap2A:F3}..{cap2B:F3}] JawR={capsuleRadius} ShaftR={shaftRadius}");
                 _uploadFrame++;
             }
+            _prevCap0A = cap0A; _prevCap0B = cap0B;
+            _prevCap1A = cap1A; _prevCap1B = cap1B;
+            _prevCap2A = cap2A; _prevCap2B = cap2B;
+            _hasPrevCapsules = true;
             _prevToolPos = _toolPos;
         }
 
@@ -422,6 +443,7 @@ namespace SurgicalSim.Grasping
 
             LoadOBJData(Path.Combine(dir, jawUpCol),   out _colVertsUp,   out _colTrisUp);
             LoadOBJData(Path.Combine(dir, jawDownCol), out _colVertsDown, out _colTrisDown);
+            LoadOBJData(Path.Combine(dir, shaftCol),   out _colVertsShaft, out _colTrisShaft);
 
             // 缩放碰撞顶点到世界单位
             if (_colVertsUp != null)
@@ -430,9 +452,37 @@ namespace SurgicalSim.Grasping
             if (_colVertsDown != null)
                 for (int i = 0; i < _colVertsDown.Length; i++)
                     _colVertsDown[i] *= modelScale;
+            if (_colVertsShaft != null)
+                for (int i = 0; i < _colVertsShaft.Length; i++)
+                    _colVertsShaft[i] *= modelScale;
 
             Debug.Log($"[GripperTool] 碰撞网格: Up {_colVertsUp?.Length}V/{_colTrisUp?.Length/3}F " +
-                      $"| Down {_colVertsDown?.Length}V/{_colTrisDown?.Length/3}F");
+                      $"| Down {_colVertsDown?.Length}V/{_colTrisDown?.Length/3}F " +
+                      $"| Shaft {_colVertsShaft?.Length}V/{_colTrisShaft?.Length/3}F");
+
+            FitShaftCapsuleFromCollisionMesh();
+        }
+
+        void FitShaftCapsuleFromCollisionMesh()
+        {
+            if (_colVertsShaft == null || _colVertsShaft.Length == 0)
+                return;
+
+            Vector3 min = _colVertsShaft[0];
+            Vector3 max = _colVertsShaft[0];
+            for (int i = 1; i < _colVertsShaft.Length; i++)
+            {
+                min = Vector3.Min(min, _colVertsShaft[i]);
+                max = Vector3.Max(max, _colVertsShaft[i]);
+            }
+
+            float centerX = (min.x + max.x) * 0.5f;
+            float centerY = (min.y + max.y) * 0.5f;
+            _shaftEndLocal = new Vector3(centerX, centerY, max.z);
+            _shaftTipLocal = new Vector3(centerX, centerY, min.z);
+
+            Debug.Log($"[GripperTool] Shaft capsule fitted from collision mesh: " +
+                      $"localZ=[{min.z:F3}, {max.z:F3}] center=({centerX:F3}, {centerY:F3}) radius={shaftRadius:F3}");
         }
 
         GameObject CreateMeshObj(string name, string objFile, Material mat)
@@ -579,7 +629,7 @@ namespace SurgicalSim.Grasping
             Gizmos.color = new Color(0f, 1f, 0f, 0.3f);
             Quaternion toolRot = Quaternion.Euler(0, _toolRotY, 0);
             Vector3 shaftA = toolRot * _shaftEndLocal + _toolPos;
-            Vector3 shaftB = toolRot * _pivotLocal + _toolPos;
+            Vector3 shaftB = toolRot * _shaftTipLocal + _toolPos;
             DrawCapsuleGizmo(shaftA, shaftB, shaftRadius);
 
             // AABB — 黄色线框

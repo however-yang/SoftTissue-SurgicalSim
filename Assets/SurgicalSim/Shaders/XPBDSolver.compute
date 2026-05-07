@@ -29,6 +29,12 @@ float4 _Capsule1A;        // xyz=端点A, w=半径
 float4 _Capsule1B;        // xyz=端点B, w=unused
 float4 _Capsule2A;        // xyz=端点A (shaft), w=半径
 float4 _Capsule2B;        // xyz=端点B (shaft), w=unused
+float4 _PrevCapsule0A;    // xyz=上一帧端点A, w=半径
+float4 _PrevCapsule0B;    // xyz=上一帧端点B, w=unused
+float4 _PrevCapsule1A;
+float4 _PrevCapsule1B;
+float4 _PrevCapsule2A;
+float4 _PrevCapsule2B;
 float4 _ToolBBoxMin;      // xyz=AABB min
 float4 _ToolBBoxMax;      // xyz=AABB max, w=胶囊体数量 (0=off)
 float  _Damping;         // 速度阻尼 (0~1)
@@ -549,7 +555,9 @@ void ConsiderTriCapsuleCandidate(
 {
     float3 delta = triPoint - capPoint;
     float dist = length(delta);
-    float3 n = (dist > 1e-8) ? (delta / dist) : fallbackNormal;
+    float3 n = delta / max(dist, 1e-8);
+    if (dist <= 1e-8)
+        n = fallbackNormal;
     float c = dist - capR - _ToolContactDistance;
     if (c < bestC)
     {
@@ -617,6 +625,19 @@ void EvaluateTriCapsuleContact(
     ConsiderTriCapsuleCandidate(edgePt, capPt, float3(sEdge, 0.0, 1.0 - sEdge), capR, triN, bestC, bestNormal, bestBary);
 }
 
+void EvaluateSweptTriCapsuleContact(
+    float3 a, float3 b, float3 c,
+    float3 capA, float3 capB, float3 prevA, float3 prevB, float capR,
+    inout float bestC, inout float3 bestNormal, inout float3 bestBary)
+{
+    EvaluateTriCapsuleContact(a, b, c, capA, capB, capR, bestC, bestNormal, bestBary);
+    EvaluateTriCapsuleContact(a, b, c, prevA, prevB, capR, bestC, bestNormal, bestBary);
+    EvaluateTriCapsuleContact(a, b, c, (capA + prevA) * 0.5, (capB + prevB) * 0.5, capR, bestC, bestNormal, bestBary);
+
+    EvaluateTriCapsuleContact(a, b, c, prevA, capA, capR, bestC, bestNormal, bestBary);
+    EvaluateTriCapsuleContact(a, b, c, prevB, capB, capR, bestC, bestNormal, bestBary);
+}
+
 [numthreads(64,1,1)]
 void CSSolveSurfaceToolContacts(uint3 id : SV_DispatchThreadID)
 {
@@ -639,54 +660,59 @@ void CSSolveSurfaceToolContacts(uint3 id : SV_DispatchThreadID)
     float3 p1 = _Positions[ids.y].xyz;
     float3 p2 = _Positions[ids.z].xyz;
 
-    float bestC = 1e20;
-    float3 bestNormal = float3(0.0, 1.0, 0.0);
-    float3 bestBary = float3(0.0, 0.0, 0.0);
+    float3 prev0 = _PrevPositions[ids.x].xyz;
+    float3 prev1 = _PrevPositions[ids.y].xyz;
+    float3 prev2 = _PrevPositions[ids.z].xyz;
 
-    if (numCapsules >= 1)
-        EvaluateTriCapsuleContact(p0, p1, p2, _Capsule0A.xyz, _Capsule0B.xyz, _Capsule0A.w, bestC, bestNormal, bestBary);
-    if (numCapsules >= 2)
-        EvaluateTriCapsuleContact(p0, p1, p2, _Capsule1A.xyz, _Capsule1B.xyz, _Capsule1A.w, bestC, bestNormal, bestBary);
-    if (numCapsules >= 3)
-        EvaluateTriCapsuleContact(p0, p1, p2, _Capsule2A.xyz, _Capsule2B.xyz, _Capsule2A.w, bestC, bestNormal, bestBary);
+    for (int contactPass = 0; contactPass < 2; contactPass++)
+    {
+        float bestC = 1e20;
+        float3 bestNormal = float3(0.0, 1.0, 0.0);
+        float3 bestBary = float3(0.0, 0.0, 0.0);
 
-    if (bestC >= 0.0) return;
+        if (numCapsules >= 1)
+            EvaluateSweptTriCapsuleContact(p0, p1, p2, _Capsule0A.xyz, _Capsule0B.xyz, _PrevCapsule0A.xyz, _PrevCapsule0B.xyz, _Capsule0A.w, bestC, bestNormal, bestBary);
+        if (numCapsules >= 2)
+            EvaluateSweptTriCapsuleContact(p0, p1, p2, _Capsule1A.xyz, _Capsule1B.xyz, _PrevCapsule1A.xyz, _PrevCapsule1B.xyz, _Capsule1A.w, bestC, bestNormal, bestBary);
+        if (numCapsules >= 3)
+            EvaluateSweptTriCapsuleContact(p0, p1, p2, _Capsule2A.xyz, _Capsule2B.xyz, _PrevCapsule2A.xyz, _PrevCapsule2B.xyz, _Capsule2A.w, bestC, bestNormal, bestBary);
 
-    float b0 = bestBary.x;
-    float b1 = bestBary.y;
-    float b2 = bestBary.z;
-    float denom = w0 * b0 * b0 + w1 * b1 * b1 + w2 * b2 * b2;
-    if (denom <= 1e-12) return;
+        if (bestC >= 0.0)
+            break;
 
-    float dlambda = (-bestC) / (denom + max(_ToolContactAlpha, 0.0));
-    float3 dx = dlambda * bestNormal;
+        float b0 = bestBary.x;
+        float b1 = bestBary.y;
+        float b2 = bestBary.z;
+        float denom = w0 * b0 * b0 + w1 * b1 * b1 + w2 * b2 * b2;
+        if (denom <= 1e-12)
+            break;
 
-    p0 += w0 * b0 * dx;
-    p1 += w1 * b1 * dx;
-    p2 += w2 * b2 * dx;
+        float dlambda = (-bestC) / (denom + max(_ToolContactAlpha, 0.0));
+        float3 dx = dlambda * bestNormal;
+
+        p0 += w0 * b0 * dx;
+        p1 += w1 * b1 * dx;
+        p2 += w2 * b2 * dx;
+
+        float3 contactNow = b0 * p0 + b1 * p1 + b2 * p2;
+        float3 contactPrev = b0 * prev0 + b1 * prev1 + b2 * prev2;
+        float vn = dot(contactNow - contactPrev, bestNormal);
+
+        if (vn < 0.0)
+        {
+            float3 prevDx = vn * bestNormal;
+            prev0 += (w0 * b0 / denom) * prevDx;
+            prev1 += (w1 * b1 / denom) * prevDx;
+            prev2 += (w2 * b2 / denom) * prevDx;
+        }
+    }
 
     _Positions[ids.x] = float4(p0, 0.0);
     _Positions[ids.y] = float4(p1, 0.0);
     _Positions[ids.z] = float4(p2, 0.0);
-
-    float3 prev0 = _PrevPositions[ids.x].xyz;
-    float3 prev1 = _PrevPositions[ids.y].xyz;
-    float3 prev2 = _PrevPositions[ids.z].xyz;
-    float3 contactNow = b0 * p0 + b1 * p1 + b2 * p2;
-    float3 contactPrev = b0 * prev0 + b1 * prev1 + b2 * prev2;
-    float vn = dot(contactNow - contactPrev, bestNormal);
-
-    if (vn < 0.0)
-    {
-        float3 prevDx = vn * bestNormal;
-        prev0 += (w0 * b0 / denom) * prevDx;
-        prev1 += (w1 * b1 / denom) * prevDx;
-        prev2 += (w2 * b2 / denom) * prevDx;
-
-        _PrevPositions[ids.x] = float4(prev0, 0.0);
-        _PrevPositions[ids.y] = float4(prev1, 0.0);
-        _PrevPositions[ids.z] = float4(prev2, 0.0);
-    }
+    _PrevPositions[ids.x] = float4(prev0, 0.0);
+    _PrevPositions[ids.y] = float4(prev1, 0.0);
+    _PrevPositions[ids.z] = float4(prev2, 0.0);
 }
 
 // ═══════════════════════════════════════════════════════

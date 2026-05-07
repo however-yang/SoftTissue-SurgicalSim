@@ -51,6 +51,7 @@ namespace SurgicalSim.Physics
         public float ToolContactDistance = 0.01f;
         public float ToolContactCompliance = 1e-7f;
         public int ToolContactIterations = 2;
+        public int ToolContactCouplingPasses = 2;
 
         [System.Runtime.InteropServices.StructLayout(
             System.Runtime.InteropServices.LayoutKind.Sequential)]
@@ -346,9 +347,13 @@ namespace SurgicalSim.Physics
                 // 4. 地面碰撞
                 Go(_kGroundCollision, _numP);
 
-                // 5. 内部约束扩散接触位移，然后最终再投影一次接触，避免弹性约束把表面拉回工具内
-                SolveInternalOnce();
-                SolveToolContacts();
+                // 5. 内部约束和接触交替求解，让局部压陷能扩散到体内，同时保持最终不穿模
+                int couplingPasses = Mathf.Max(1, ToolContactCouplingPasses);
+                for (int pass = 0; pass < couplingPasses; pass++)
+                {
+                    SolveInternalOnce();
+                    SolveToolContacts();
+                }
 
                 // 6. 更新速度 + 阻尼
                 Go(_kPostSolve, _numP);
@@ -460,6 +465,9 @@ namespace SurgicalSim.Physics
             Vector3 cap0A, Vector3 cap0B, float cap0R,
             Vector3 cap1A, Vector3 cap1B, float cap1R,
             Vector3 cap2A, Vector3 cap2B, float cap2R,
+            Vector3 prevCap0A, Vector3 prevCap0B,
+            Vector3 prevCap1A, Vector3 prevCap1B,
+            Vector3 prevCap2A, Vector3 prevCap2B,
             int numCapsules)
         {
             _cs.SetVector("_Capsule0A", new Vector4(cap0A.x, cap0A.y, cap0A.z, cap0R));
@@ -468,6 +476,12 @@ namespace SurgicalSim.Physics
             _cs.SetVector("_Capsule1B", new Vector4(cap1B.x, cap1B.y, cap1B.z, 0f));
             _cs.SetVector("_Capsule2A", new Vector4(cap2A.x, cap2A.y, cap2A.z, cap2R));
             _cs.SetVector("_Capsule2B", new Vector4(cap2B.x, cap2B.y, cap2B.z, 0f));
+            _cs.SetVector("_PrevCapsule0A", new Vector4(prevCap0A.x, prevCap0A.y, prevCap0A.z, cap0R));
+            _cs.SetVector("_PrevCapsule0B", new Vector4(prevCap0B.x, prevCap0B.y, prevCap0B.z, 0f));
+            _cs.SetVector("_PrevCapsule1A", new Vector4(prevCap1A.x, prevCap1A.y, prevCap1A.z, cap1R));
+            _cs.SetVector("_PrevCapsule1B", new Vector4(prevCap1B.x, prevCap1B.y, prevCap1B.z, 0f));
+            _cs.SetVector("_PrevCapsule2A", new Vector4(prevCap2A.x, prevCap2A.y, prevCap2A.z, cap2R));
+            _cs.SetVector("_PrevCapsule2B", new Vector4(prevCap2B.x, prevCap2B.y, prevCap2B.z, 0f));
             _cs.SetVector("_ToolBBoxMin", Vector4.zero);
             _cs.SetVector("_ToolBBoxMax", new Vector4(0f, 0f, 0f, numCapsules));
         }

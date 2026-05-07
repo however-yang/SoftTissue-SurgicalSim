@@ -3,6 +3,7 @@
 // GPU 加速版本（已驗證 CPU 等價性後移植到 GPU）
 
 using UnityEngine;
+using System.IO;
 using SurgicalSim.Core;
 using SurgicalSim.Physics;
 using SurgicalSim.Cutting;
@@ -69,6 +70,8 @@ namespace SurgicalSim
         public float toolContactCompliance = 1e-7f;
         [Range(1, 8)]
         public int toolContactIterations = 2;
+        [Range(1, 4)]
+        public int toolContactCouplingPasses = 2;
 
         [Header("切割")]
         [Tooltip("啟用鼠標拖拽切割")]
@@ -88,6 +91,20 @@ namespace SurgicalSim
 
         [Tooltip("肝臟表面顏色")]
         public Color liverColor = new Color(0.85f, 0.25f, 0.15f, 1f);
+
+        [Tooltip("肝臟表面紋理。留空時會嘗試自動載入 Assets/Texture/liver2.png")]
+        public Texture2D liverTexture;
+
+        [Range(0f, 1f)]
+        public float liverTextureStrength = 0.65f;
+
+        public Vector2 liverTextureTiling = Vector2.one;
+
+        [Range(0.1f, 20f)]
+        public float liverTriplanarScale = 2.5f;
+
+        [Range(0.1f, 16f)]
+        public float liverTriplanarBlend = 4f;
 
         [Header("調試")]
         public bool pausePhysics = false;
@@ -164,7 +181,8 @@ namespace SurgicalSim
                 GroundY          = groundY,
                 ToolContactDistance = toolContactDistance,
                 ToolContactCompliance = toolContactCompliance,
-                ToolContactIterations = toolContactIterations
+                ToolContactIterations = toolContactIterations,
+                ToolContactCouplingPasses = toolContactCouplingPasses
             };
             _gpuSolver.Init(data);
 
@@ -233,6 +251,7 @@ namespace SurgicalSim
             _gpuSolver.ToolContactDistance = toolContactDistance;
             _gpuSolver.ToolContactCompliance = toolContactCompliance;
             _gpuSolver.ToolContactIterations = toolContactIterations;
+            _gpuSolver.ToolContactCouplingPasses = toolContactCouplingPasses;
 
             // ★ 夹爪碰撞: 在 Step 之前上传平面参数到 GPU
             if (_gripperTool != null)
@@ -365,13 +384,46 @@ namespace SurgicalSim
             var mat = new Material(shader);
             mat.SetColor("_Color", liverColor);
             mat.SetColor("_InteriorColor", interiorColor);
+            mat.SetFloat("_TextureStrength", liverTextureStrength);
+            mat.SetFloat("_TriplanarScale", liverTriplanarScale);
+            mat.SetFloat("_TriplanarBlend", liverTriplanarBlend);
+            mat.SetTextureScale("_MainTex", liverTextureTiling);
+
+            Texture2D tex = liverTexture;
+#if UNITY_EDITOR
+            if (tex == null)
+                tex = UnityEditor.AssetDatabase.LoadAssetAtPath<Texture2D>("Assets/Texture/liver2.png");
+#endif
+            if (tex == null)
+                tex = LoadTextureFromAssetsPath("Texture/liver2.png");
+            if (tex != null)
+                mat.SetTexture("_MainTex", tex);
 
             var renderer = _visualizer.GetComponent<MeshRenderer>();
             if (renderer != null)
             {
+                _visualizer.surfaceMaterial = mat;
                 renderer.material = mat;
-                Debug.Log("[SoftBody] 双面渲染材质已设置（外表面 + 切面内部）");
+                Debug.Log($"[SoftBody] 双面渲染材质已设置（外表面 + 切面内部） | Texture={(tex != null ? tex.name : "none")}");
             }
+        }
+
+        Texture2D LoadTextureFromAssetsPath(string relativePath)
+        {
+            string path = Path.Combine(Application.dataPath, relativePath);
+            if (!File.Exists(path)) return null;
+
+            byte[] bytes = File.ReadAllBytes(path);
+            var tex = new Texture2D(2, 2, TextureFormat.RGBA32, true);
+            tex.name = Path.GetFileNameWithoutExtension(path);
+            if (!tex.LoadImage(bytes))
+            {
+                Destroy(tex);
+                return null;
+            }
+            tex.wrapMode = TextureWrapMode.Repeat;
+            tex.filterMode = FilterMode.Bilinear;
+            return tex;
         }
 
         // ── 地面平面 ──────────────────────────────────────────
