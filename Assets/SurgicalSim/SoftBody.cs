@@ -9,6 +9,7 @@ using SurgicalSim.Physics;
 using SurgicalSim.Cutting;
 using SurgicalSim.CuttingV3;
 using SurgicalSim.Grasping;
+using SurgicalSim.Rendering;
 
 namespace SurgicalSim
 {
@@ -85,26 +86,131 @@ namespace SurgicalSim
         [Range(0.0005f, 0.02f)]
         public float virtualBladeRadius = 0.0025f;
 
-        [Header("切面渲染")]
-        [Tooltip("切面內部顏色（双面渲染的背面色）")]
-        public Color interiorColor = new Color(0.85f, 0.45f, 0.45f, 1f);
+        [Header("渲染 - 基础颜色")]
+        [Tooltip("切面內部顏色（切割内表面色）")]
+        public Color interiorColor = new Color(0.30f, 0.025f, 0.018f, 1f);
 
         [Tooltip("肝臟表面顏色")]
-        public Color liverColor = new Color(0.85f, 0.25f, 0.15f, 1f);
+        public Color liverColor = new Color(0.62f, 0.18f, 0.10f, 1f);
 
-        [Tooltip("肝臟表面紋理。留空時會嘗試自動載入 Assets/Texture/liver2.png")]
+        [Tooltip("肝臟表面紋理（Albedo）。留空時嘗試自動載入 Assets/Texture/liver2.png")]
         public Texture2D liverTexture;
 
         [Range(0f, 1f)]
-        public float liverTextureStrength = 0.65f;
+        public float liverTextureStrength = 0.98f;
+
+        [Range(0.25f, 2.5f)]
+        public float liverTextureContrast = 1.35f;
+
+        [Range(0f, 1f)]
+        public float liverTextureColorBlend = 1.0f;
+
+        [Range(0f, 1f)]
+        public float liverUvTextureWeight = 0.0f;
 
         public Vector2 liverTextureTiling = Vector2.one;
 
         [Range(0.1f, 20f)]
-        public float liverTriplanarScale = 2.5f;
+        public float liverTriplanarScale = 5.5f;
 
         [Range(0.1f, 16f)]
         public float liverTriplanarBlend = 4f;
+
+        [Header("渲染 - 法线贴图")]
+        [Tooltip("法线贴图 (Normal Map)，留空则不使用")]
+        public Texture2D liverNormalMap;
+
+        [Tooltip("SofaUnity liver2_height.png，用于恢复表面细节明暗")]
+        public Texture2D liverHeightMap;
+
+        [Tooltip("SofaUnity liver2_spec.png，用于控制局部湿润高光")]
+        public Texture2D liverSpecularMap;
+
+        [Range(0f, 3f)]
+        [Tooltip("法线贴图强度")]
+        public float liverNormalStrength = 0.12f;
+
+        [Range(0f, 2f)]
+        public float liverProceduralNormalStrength = 0.05f;
+
+        [Header("渲染 - PBR 高光")]
+        [Range(0f, 1f)]
+        [Tooltip("粗糙度 (0=镜面, 1=粗糙漫反射)。肝脏约 0.25-0.35")]
+        public float liverRoughness = 0.70f;
+
+        [Range(0f, 3f)]
+        [Tooltip("GGX 高光强度")]
+        public float liverSpecularStrength = 0.18f;
+
+        [Tooltip("高光颜色（稍偏暖色模拟湿润感）")]
+        public Color liverSpecularColor = new Color(0.95f, 0.90f, 0.85f, 1f);
+
+        [Header("渲染 - 次表面散射 SSS")]
+        [Tooltip("SSS 散射颜色（肝脏应为橙红色）")]
+        public Color liverSSSColor = new Color(0.76f, 0.13f, 0.055f, 1f);
+
+        [Range(0f, 3f)]
+        [Tooltip("SSS 包裹漫射强度")]
+        public float liverSSSStrength = 0.06f;
+
+        [Range(0f, 2f)]
+        [Tooltip("背光透射强度（光从背面穿透薄组织）")]
+        public float liverSSSBacklight = 0.04f;
+
+        [Range(1f, 24f)]
+        [Tooltip("背光聚焦度（值越大高光越集中）")]
+        public float liverSSSPower = 7f;
+
+        [Range(0f, 1f)]
+        [Tooltip("漫射 Wrap 因子（光线绕到暗面的程度）")]
+        public float liverSSSWrap = 0.32f;
+
+        [Header("渲染 - Fresnel 边缘")]
+        [Range(0f, 3f)]
+        [Tooltip("Fresnel 边缘光强度（模拟湿润边缘反光）")]
+        public float liverFresnelStrength = 0.08f;
+
+        [Range(1f, 8f)]
+        [Tooltip("Fresnel 衰减速度")]
+        public float liverFresnelPow = 4.2f;
+
+        [Header("Rendering - GPU Tissue Detail")]
+        [Range(0f, 1f)]
+        public float liverWetness = 0.18f;
+
+        [Range(0f, 1f)]
+        public float liverMicroMottleStrength = 0.08f;
+
+        [Range(1f, 80f)]
+        public float liverMicroMottleScale = 20f;
+
+        [Range(0.2f, 1.5f)]
+        public float liverAlbedoBrightness = 0.82f;
+
+        [Range(0f, 1f)]
+        public float liverVeinStrength = 0.10f;
+
+        [Range(1f, 80f)]
+        public float liverVeinScale = 22f;
+
+        [Range(0f, 1f)]
+        [Tooltip("调试用：1 时直接显示 liver2.png，绕过光照。用于判断是否是 UV/贴图链路问题。")]
+        public float liverDebugTextureOnly = 0f;
+
+        [Header("Rendering - SofaUnity Visual Mesh")]
+        public bool useSofaUnityVisualMesh = true;
+        public bool hideTetSurfaceWhenSofaVisualActive = true;
+        [Tooltip("Use the current liver3-HD tetra surface for the SofaUnity visual renderer. This matches Project2's Tetra2TriangleTopologicalMapping path and avoids misbinding an external OBJ shell.")]
+        public bool useTetSurfaceForSofaUnityVisual = true;
+        [Tooltip("Replicate Project2 Assets/SofaUnity/Core/Resources/Materials/Liver2.mat for the visible liver surface.")]
+        public bool useProject2Liver2Material = true;
+        public Vector2 sofaUnityVisualUvTiling = Vector2.one;
+        public TextAsset sofaUnityVisualObj;
+        public Material sofaUnityVisualMaterial;
+        public string sofaUnityVisualObjResource = "SurgicalSim/SofaUnity/liver-smooth-obj";
+
+        [Range(0.75f, 1.05f)]
+        public float sofaUnityVisualFitPadding = 0.985f;
 
         [Header("調試")]
         public bool pausePhysics = false;
@@ -118,6 +224,10 @@ namespace SurgicalSim
         GameObject        _groundPlane;
         CuttingToolV3     _cuttingTool;
         GripperTool       _gripperTool;
+        SofaUnityVisualLiverRenderer _sofaVisualRenderer;
+        Texture2D         _resolvedLiverTexture;
+        Texture2D         _resolvedProject2BumpTexture;
+        Texture2D         _resolvedLiverHeightTexture;
 
 
 
@@ -207,6 +317,7 @@ namespace SurgicalSim
 
             // 設置雙面渲染材質（切面內部顏色）
             SetupTwoSidedMaterial();
+            SetupSofaUnityVisualRendering();
 
             _physicsReady = true;
 
@@ -302,6 +413,7 @@ namespace SurgicalSim
             _physicsFrame++;
 
             _visualizer.Refresh();
+            _sofaVisualRenderer?.Refresh();
 
         }
 
@@ -371,24 +483,378 @@ namespace SurgicalSim
                       $"InvMass范围: [{minInvM:G4}, {maxInvM:G4}]");
         }
 
-        // ── 双面材质设置 ──────────────────────────────────────
+        // SofaUnity's textured liver uses a visual OBJ with authored UVs plus mapping to the tetra body.
+        // This runtime surface is generated from tetra faces, so use rest-position triplanar sampling first.
         void SetupTwoSidedMaterial()
         {
-            var shader = Shader.Find("SurgicalSim/TwoSidedLiver");
+            Shader shader = Shader.Find("SurgicalSim/LiverTissueGPU");
+            if (shader == null)
+                shader = Shader.Find("SurgicalSim/PhotorealisticLiver");
             if (shader == null)
             {
-                Debug.LogWarning("[SoftBody] 未找到 SurgicalSim/TwoSidedLiver 着色器，使用默认材质");
+                Debug.LogWarning("[SoftBody] LiverTissueGPU not found, fallback to URP/Lit.");
+                shader = Shader.Find("Universal Render Pipeline/Lit");
+            }
+            if (shader == null) { Debug.LogError("[SoftBody] No shader found!"); return; }
+
+            var mat = new Material(shader) { name = "Runtime_LiverSurface" };
+
+            // ── Albedo 纹理 ─────────────────────────────────────────────────
+            Texture2D tex = liverTexture;
+#if UNITY_EDITOR
+            if (tex == null) tex = UnityEditor.AssetDatabase.LoadAssetAtPath<Texture2D>("Assets/Texture/liver2.png");
+#endif
+            if (tex == null) tex = LoadTextureFromAssetsPath("Texture/liver2.png");
+            _resolvedLiverTexture = tex;
+
+            // ── 法线贴图 ────────────────────────────────────────────────────
+            Texture2D normTex = liverNormalMap;
+#if UNITY_EDITOR
+            if (normTex == null) normTex = UnityEditor.AssetDatabase.LoadAssetAtPath<Texture2D>("Assets/Texture/liver-texture-square_bump.png");
+#endif
+            if (normTex == null) normTex = LoadTextureFromAssetsPath("Texture/liver-texture-square_bump.png");
+
+            Texture2D heightTex = liverHeightMap;
+#if UNITY_EDITOR
+            if (heightTex == null) heightTex = UnityEditor.AssetDatabase.LoadAssetAtPath<Texture2D>("Assets/Texture/liver2_height.png");
+#endif
+            if (heightTex == null) heightTex = LoadTextureFromAssetsPath("Texture/liver2_height.png");
+            _resolvedLiverHeightTexture = heightTex;
+
+            // ── 高光贴图 ────────────────────────────────────────────────────
+            Texture2D specTex = liverSpecularMap;
+#if UNITY_EDITOR
+            if (specTex == null) specTex = UnityEditor.AssetDatabase.LoadAssetAtPath<Texture2D>("Assets/Texture/liver2_spec.png");
+#endif
+            if (specTex == null) specTex = LoadTextureFromAssetsPath("Texture/liver2_spec.png");
+            _resolvedProject2BumpTexture = specTex;
+
+            // 纹理诊断
+            string _diagTex  = tex     != null ? (tex.name + " " + tex.width + "x" + tex.height) : "NULL! 纹理加载失败!";
+            string _diagNorm = normTex != null ? normTex.name : "null";
+            string _diagHeight = heightTex != null ? heightTex.name : "null";
+            string _diagSpec = specTex != null ? specTex.name : "null";
+            Debug.LogWarning("[SoftBody] texture check | tex=" + _diagTex + " | bump=" + _diagNorm +
+                             " | height=" + _diagHeight + " | spec=" + _diagSpec);
+
+            // ── 材质参数配置 ────────────────────────────────────────────────
+            // 颜色: 深红棕，匹配 SofaUnity 生物组织色相
+            Color surfaceColor = EffectiveLiverColor();
+            SetColorIf(mat, "_Color",         surfaceColor);
+            SetColorIf(mat, "_BaseColor",     surfaceColor);
+            SetColorIf(mat, "_InteriorColor",  EffectiveCutColor());
+            SetColorIf(mat, "_SSSColor",       liverSSSColor);
+            SetColorIf(mat, "_SpecularColor",  liverSpecularColor);
+            SetColorIf(mat, "_SpecColor",      new Color(0.20f, 0.18f, 0.16f, 1f));
+
+            // 纹理
+            if (tex != null)
+            {
+                SetTextureIf(mat, "_MainTex", tex);
+                SetTextureIf(mat, "_BaseMap", tex);
+            }
+            if (normTex != null)
+            {
+                SetTextureIf(mat, "_NormalMap", normTex);
+            }
+            if (heightTex != null)
+            {
+                SetTextureIf(mat, "_HeightMap", heightTex);
+                SetTextureIf(mat, "_ParallaxMap", heightTex);
+            }
+            if (specTex != null)
+            {
+                SetTextureIf(mat, "_SpecMap", specTex);
+                SetTextureIf(mat, "_SpecGlossMap", specTex);
+                mat.EnableKeyword("_SPECGLOSSMAP");
+            }
+
+            SetTextureScaleIf(mat, "_MainTex", liverTextureTiling);
+            SetTextureScaleIf(mat, "_BaseMap", liverTextureTiling);
+            SetTextureScaleIf(mat, "_NormalMap", liverTextureTiling);
+            SetTextureScaleIf(mat, "_BumpMap", liverTextureTiling);
+            SetTextureScaleIf(mat, "_HeightMap", liverTextureTiling);
+            SetTextureScaleIf(mat, "_ParallaxMap", liverTextureTiling);
+            SetTextureScaleIf(mat, "_SpecMap", liverTextureTiling);
+            SetTextureScaleIf(mat, "_SpecGlossMap", liverTextureTiling);
+
+            // Triplanar 参数 — 控制纹理在世界空间的缩放
+            // TriplanarScale: 越大纹理越密 (SofaUnity 肝脏约 6~10 较合适)
+            float effectiveTriplanarScale = Mathf.Max(liverTriplanarScale, 5.5f);
+            float effectiveTextureStrength = Mathf.Max(liverTextureStrength, 0.95f);
+
+            SetFloatIf(mat, "_TriplanarScale",  effectiveTriplanarScale);
+            SetFloatIf(mat, "_TriplanarBlend",  liverTriplanarBlend > 0 ? liverTriplanarBlend : 5.0f);
+            SetFloatIf(mat, "_TextureStrength", effectiveTextureStrength);
+            SetFloatIf(mat, "_TextureContrast", Mathf.Max(liverTextureContrast, 1.35f));
+            SetFloatIf(mat, "_TextureColorBlend", 1f);
+            SetFloatIf(mat, "_UvTextureWeight", 0f);
+            SetFloatIf(mat, "_AlbedoBrightness", Mathf.Min(liverAlbedoBrightness, 0.82f));
+            SetFloatIf(mat, "_ProceduralNormalStrength", Mathf.Min(liverProceduralNormalStrength, 0.05f));
+            SetFloatIf(mat, "_Wetness", Mathf.Min(liverWetness, 0.18f));
+            SetFloatIf(mat, "_MicroMottleStrength", Mathf.Min(liverMicroMottleStrength, 0.08f));
+            SetFloatIf(mat, "_MicroMottleScale", liverMicroMottleScale);
+            SetFloatIf(mat, "_VeinStrength", liverVeinStrength);
+            SetFloatIf(mat, "_VeinScale", liverVeinScale);
+            SetFloatIf(mat, "_DebugTextureOnly", liverDebugTextureOnly);
+
+            // SofaUnity's material is textured first and only mildly glossy. Too much smoothness washes the texture out.
+            SetFloatIf(mat, "_Roughness",        Mathf.Max(liverRoughness, 0.70f));
+            SetFloatIf(mat, "_Smoothness",       0.10f);
+            SetFloatIf(mat, "_Glossiness",       0.10f);
+            SetFloatIf(mat, "_Metallic",         0f);
+            SetFloatIf(mat, "_SpecularStrength", Mathf.Min(liverSpecularStrength, 0.18f));
+            SetFloatIf(mat, "_SpecMapStrength",  0.65f);
+            SetFloatIf(mat, "_NormalStrength",   Mathf.Min(Mathf.Max(liverNormalStrength, 0.04f), 0.12f));
+
+            // SSS 参数
+            SetFloatIf(mat, "_SSSStrength", Mathf.Min(liverSSSStrength, 0.06f));
+            SetFloatIf(mat, "_SSSDirect",   Mathf.Min(liverSSSBacklight, 0.04f));
+            SetFloatIf(mat, "_SSSPower",    liverSSSPower);
+            SetFloatIf(mat, "_SSSWrap",     liverSSSWrap);
+
+            // Fresnel
+            SetFloatIf(mat, "_FresnelStrength", Mathf.Min(liverFresnelStrength, 0.08f));
+            SetFloatIf(mat, "_FresnelPow",      liverFresnelPow);
+            ConfigureOpaqueTwoSided(mat);
+            mat.doubleSidedGI = true;
+
+            // 应用材质
+            if (_visualizer != null)
+            {
+                _visualizer.SetSurfaceMaterial(mat);
+                Material cutMat = CreateCutSurfaceMaterial();
+                if (cutMat != null)
+                    _visualizer.SetCutSurfaceMaterial(cutMat);
+            }
+            else
+            {
+                var mr = GetComponent<MeshRenderer>();
+                if (mr != null) mr.sharedMaterial = mat;
+            }
+
+            Debug.Log("[SoftBody] SofaUnity-style triplanar liver material applied | Shader=" + shader.name +
+                      " | Albedo=" + (tex != null ? tex.name : "MISSING!") +
+                      " | Height=" + (heightTex != null ? heightTex.name : "none") +
+                      " | Spec=" + (specTex != null ? specTex.name : "none") +
+                      " | UVWeight=0.00" +
+                      " | TriScale=" + effectiveTriplanarScale.ToString("F2"));
+        }
+
+        void SetupSofaUnityVisualRendering()
+        {
+            if (_visualizer == null || _data == null) return;
+
+            if (!useSofaUnityVisualMesh)
+            {
+                _visualizer.SetMainSurfaceVisible(true);
+                return;
+            }
+
+            if (_sofaVisualRenderer == null)
+                _sofaVisualRenderer = GetComponent<SofaUnityVisualLiverRenderer>();
+            if (_sofaVisualRenderer == null)
+                _sofaVisualRenderer = gameObject.AddComponent<SofaUnityVisualLiverRenderer>();
+
+            Texture2D tex = _resolvedLiverTexture != null ? _resolvedLiverTexture : liverTexture;
+            Texture2D project2BumpTex = _resolvedProject2BumpTexture;
+            Texture2D project2HeightTex = _resolvedLiverHeightTexture;
+
+            if (project2BumpTex == null)
+            {
+#if UNITY_EDITOR
+                project2BumpTex = UnityEditor.AssetDatabase.LoadAssetAtPath<Texture2D>("Assets/Texture/liver2_spec.png");
+#endif
+                if (project2BumpTex == null) project2BumpTex = LoadTextureFromAssetsPath("Texture/liver2_spec.png");
+            }
+
+            if (project2HeightTex == null)
+            {
+#if UNITY_EDITOR
+                project2HeightTex = UnityEditor.AssetDatabase.LoadAssetAtPath<Texture2D>("Assets/Texture/liver2_height.png");
+#endif
+                if (project2HeightTex == null) project2HeightTex = LoadTextureFromAssetsPath("Texture/liver2_height.png");
+            }
+
+            Material visualMaterial = sofaUnityVisualMaterial;
+            if (visualMaterial == null && useProject2Liver2Material)
+                visualMaterial = SofaUnityVisualLiverRenderer.CreateProject2Liver2Material(
+                    tex,
+                    project2BumpTex,
+                    project2HeightTex);
+
+            Vector2 visualUvTiling = useProject2Liver2Material ? Vector2.one : sofaUnityVisualUvTiling;
+            bool initialized = _sofaVisualRenderer.Init(
+                _data,
+                tex,
+                visualMaterial,
+                sofaUnityVisualObj,
+                sofaUnityVisualObjResource,
+                sofaUnityVisualFitPadding,
+                useTetSurfaceForSofaUnityVisual,
+                visualUvTiling);
+
+            _visualizer.SetMainSurfaceVisible(!(initialized && hideTetSurfaceWhenSofaVisualActive));
+
+            if (initialized)
+            {
+                string source = useTetSurfaceForSofaUnityVisual
+                    ? "current liver3-HD tet surface"
+                    : (sofaUnityVisualObj != null ? sofaUnityVisualObj.name : sofaUnityVisualObjResource);
+                Debug.Log("[SoftBody] SofaUnity visual renderer applied | Source=" +
+                          source +
+                          " | Material=" + (visualMaterial != null ? visualMaterial.name : "fallback") +
+                          " | Albedo=" + (tex != null ? tex.name : "MISSING!") +
+                          " | Bump=" + (project2BumpTex != null ? project2BumpTex.name : "none") +
+                          " | Height=" + (project2HeightTex != null ? project2HeightTex.name : "none"));
+            }
+        }
+
+        Material CreateCutSurfaceMaterial()
+        {
+            Shader shader = Shader.Find("SurgicalSim/LiverCutSurfaceGPU");
+            if (shader == null)
+                shader = Shader.Find("Universal Render Pipeline/Lit");
+            if (shader == null)
+                shader = Shader.Find("Standard");
+            if (shader == null)
+                return null;
+
+            var mat = new Material(shader)
+            {
+                name = "Runtime_LiverCutSurfaceGPU"
+            };
+            ConfigureCutSurfaceMaterial(mat);
+            return mat;
+        }
+
+        void ConfigureCutSurfaceMaterial(Material mat)
+        {
+            if (mat == null) return;
+
+            Color cutColor = EffectiveCutColor();
+
+            SetColorIf(mat, "_CutColor", cutColor);
+            SetColorIf(mat, "_InteriorColor", cutColor);
+            SetColorIf(mat, "_Color", cutColor);
+            SetColorIf(mat, "_BaseColor", cutColor);
+            SetFloatIf(mat, "_Roughness", Mathf.Clamp01(liverRoughness * 0.75f));
+            SetFloatIf(mat, "_Smoothness", Mathf.Clamp01(1f - liverRoughness * 0.75f));
+            SetFloatIf(mat, "_Glossiness", Mathf.Clamp01(1f - liverRoughness * 0.75f));
+            SetFloatIf(mat, "_Metallic", 0f);
+            SetFloatIf(mat, "_Wetness", Mathf.Clamp01(liverWetness + 0.2f));
+            SetFloatIf(mat, "_SpecularStrength", Mathf.Clamp(liverSpecularStrength + 0.25f, 0f, 2f));
+            SetColorIf(mat, "_SpecularColor", liverSpecularColor);
+            SetColorIf(mat, "_SpecColor", new Color(0.04f, 0.03f, 0.025f, 1f));
+            SetColorIf(mat, "_SSSColor", liverSSSColor);
+            SetFloatIf(mat, "_SSSStrength", Mathf.Clamp01(liverSSSStrength * 0.75f));
+            SetFloatIf(mat, "_SSSWrap", Mathf.Clamp01(liverSSSWrap * 0.75f));
+            SetFloatIf(mat, "_FiberIntensity", 0.34f);
+            SetFloatIf(mat, "_FiberScale", 36f);
+            SetFloatIf(mat, "_RimDarkening", 0.18f);
+            SetFloatIf(mat, "_TextureStrength", 0f);
+
+            ConfigureOpaqueTwoSided(mat);
+            mat.doubleSidedGI = true;
+        }
+
+        Color EffectiveLiverColor()
+        {
+            Color c = liverColor;
+            float maxChannel = Mathf.Max(c.r, Mathf.Max(c.g, c.b));
+            float minChannel = Mathf.Min(c.r, Mathf.Min(c.g, c.b));
+            float saturation = maxChannel <= 1e-5f ? 0f : (maxChannel - minChannel) / maxChannel;
+            if (maxChannel > 0.82f || saturation < 0.35f || c.g > c.r * 0.40f || c.b > c.r * 0.32f)
+                c = new Color(0.62f, 0.18f, 0.10f, liverColor.a);
+            else
+                c.a = liverColor.a;
+            return c;
+        }
+
+        Color EffectiveCutColor()
+        {
+            Color.RGBToHSV(interiorColor, out float hue, out float saturation, out float value);
+            if (saturation < 0.12f || value > 0.5f)
+                return new Color(0.30f, 0.025f, 0.018f, interiorColor.a);
+            return interiorColor;
+        }
+
+        static void SetColorIf(Material mat, string property, Color value)
+        {
+            if (mat != null && mat.HasProperty(property))
+                mat.SetColor(property, value);
+        }
+
+        static void SetFloatIf(Material mat, string property, float value)
+        {
+            if (mat != null && mat.HasProperty(property))
+                mat.SetFloat(property, value);
+        }
+
+        static void SetTextureIf(Material mat, string property, Texture texture)
+        {
+            if (mat != null && texture != null && mat.HasProperty(property))
+                mat.SetTexture(property, texture);
+        }
+
+        static void SetTextureScaleIf(Material mat, string property, Vector2 scale)
+        {
+            if (mat != null && mat.HasProperty(property))
+                mat.SetTextureScale(property, scale);
+        }
+
+        static void SetTextureOffsetIf(Material mat, string property, Vector2 offset)
+        {
+            if (mat != null && mat.HasProperty(property))
+                mat.SetTextureOffset(property, offset);
+        }
+
+        static void ConfigureOpaqueTwoSided(Material mat)
+        {
+            if (mat == null) return;
+
+            mat.SetOverrideTag("RenderType", "Opaque");
+            mat.renderQueue = (int)UnityEngine.Rendering.RenderQueue.Geometry;
+            SetFloatIf(mat, "_Surface", 0f);
+            SetFloatIf(mat, "_Blend", 0f);
+            SetFloatIf(mat, "_SrcBlend", (float)UnityEngine.Rendering.BlendMode.One);
+            SetFloatIf(mat, "_DstBlend", (float)UnityEngine.Rendering.BlendMode.Zero);
+            SetFloatIf(mat, "_ZWrite", 1f);
+            SetFloatIf(mat, "_AlphaClip", 0f);
+            SetFloatIf(mat, "_Cull", 0f);
+
+            mat.DisableKeyword("_SURFACE_TYPE_TRANSPARENT");
+            mat.DisableKeyword("_ALPHATEST_ON");
+            mat.DisableKeyword("_ALPHAPREMULTIPLY_ON");
+        }
+
+/* Legacy material setup disabled after the LiverTissueGPU migration.
+        void SetupTwoSidedMaterial_LegacyDisabled()
+        {
+            // 优先使用新的真实感着色器，回退到旧版
+            var shader = Shader.Find("SurgicalSim/PhotorealisticLiver");
+            if (shader == null)
+            {
+                Debug.LogWarning("[SoftBody] 未找到 PhotorealisticLiver 着色器，尝试 TwoSidedLiver 回退");
+                shader = Shader.Find("SurgicalSim/TwoSidedLiver");
+            }
+            if (shader == null)
+            {
+                Debug.LogWarning("[SoftBody] 未找到任何肝脏着色器，使用默认材质");
                 return;
             }
 
             var mat = new Material(shader);
-            mat.SetColor("_Color", liverColor);
-            mat.SetColor("_InteriorColor", interiorColor);
-            mat.SetFloat("_TextureStrength", liverTextureStrength);
-            mat.SetFloat("_TriplanarScale", liverTriplanarScale);
-            mat.SetFloat("_TriplanarBlend", liverTriplanarBlend);
-            mat.SetTextureScale("_MainTex", liverTextureTiling);
 
+            // ── 基础颜色 & 纹理 ──────────────────────────────────
+            mat.SetColor("_Color",          liverColor);
+            mat.SetColor("_InteriorColor",  interiorColor);
+            mat.SetFloat("_TextureStrength", liverTextureStrength);
+            mat.SetFloat("_TriplanarScale",  liverTriplanarScale);
+            mat.SetFloat("_TriplanarBlend",  liverTriplanarBlend);
+            mat.SetTextureScale("_MainTex",  liverTextureTiling);
+
+            // 自动查找 Albedo 纹理
             Texture2D tex = liverTexture;
 #if UNITY_EDITOR
             if (tex == null)
@@ -399,14 +865,47 @@ namespace SurgicalSim
             if (tex != null)
                 mat.SetTexture("_MainTex", tex);
 
+            // ── 法线贴图 ─────────────────────────────────────────
+            Texture2D normTex = liverNormalMap;
+#if UNITY_EDITOR
+            if (normTex == null)
+                normTex = UnityEditor.AssetDatabase.LoadAssetAtPath<Texture2D>("Assets/Texture/liver_normal.png");
+#endif
+            if (normTex == null)
+                normTex = LoadTextureFromAssetsPath("Texture/liver_normal.png");
+            if (normTex != null)
+                mat.SetTexture("_NormalMap", normTex);
+            mat.SetFloat("_NormalStrength", liverNormalStrength);
+
+            // ── PBR 高光 ─────────────────────────────────────────
+            mat.SetFloat("_Roughness",         liverRoughness);
+            mat.SetFloat("_SpecularStrength",   liverSpecularStrength);
+            mat.SetColor("_SpecularColor",      liverSpecularColor);
+
+            // ── SSS ──────────────────────────────────────────────
+            mat.SetColor("_SSSColor",    liverSSSColor);
+            mat.SetFloat("_SSSStrength", liverSSSStrength);
+            mat.SetFloat("_SSSDirect",   liverSSSBacklight);
+            mat.SetFloat("_SSSPower",    liverSSSPower);
+            mat.SetFloat("_SSSWrap",     liverSSSWrap);
+
+            // ── Fresnel ──────────────────────────────────────────
+            mat.SetFloat("_FresnelStrength", liverFresnelStrength);
+            mat.SetFloat("_FresnelPow",      liverFresnelPow);
+
             var renderer = _visualizer.GetComponent<MeshRenderer>();
             if (renderer != null)
             {
                 _visualizer.surfaceMaterial = mat;
                 renderer.material = mat;
-                Debug.Log($"[SoftBody] 双面渲染材质已设置（外表面 + 切面内部） | Texture={(tex != null ? tex.name : "none")}");
+                Debug.Log($"[SoftBody] ★ PhotorealisticLiver 材质已设置 | " +
+                          $"Albedo={(tex != null ? tex.name : "none")} | " +
+                          $"Normal={(normTex != null ? normTex.name : "none")} | " +
+                          $"Roughness={liverRoughness:F2} | SSSStrength={liverSSSStrength:F2}");
             }
         }
+
+*/
 
         Texture2D LoadTextureFromAssetsPath(string relativePath)
         {
@@ -549,6 +1048,7 @@ namespace SurgicalSim
 
 
             _visualizer.Refresh();
+            _sofaVisualRenderer?.Refresh();
             Debug.Log("[SoftBody] 重置完成（含切割狀態）");
         }
 
@@ -574,6 +1074,13 @@ namespace SurgicalSim
             int cutCandidates = _cuttingTool != null ? _cuttingTool.LastCandidateTetCount : 0;
             int cutHits = _cuttingTool != null ? _cuttingTool.LastIntersectedTetCount : 0;
             string cutReason = _cuttingTool != null ? _cuttingTool.LastCutRejectReason : "no_tool";
+            int cutSeparated = _cuttingTool != null ? _cuttingTool.LastSeparatedVertexCount : 0;
+            int cutRemainingShared = _cuttingTool != null ? _cuttingTool.LastRemainingSharedVertexCount : 0;
+            float cutQueryMs = _cuttingTool != null ? _cuttingTool.LastCutQueryMs : 0f;
+            float cutSplitMs = _cuttingTool != null ? _cuttingTool.LastCutSplitMs : 0f;
+            float cutSeparateMs = _cuttingTool != null ? _cuttingTool.LastCutSeparateMs : 0f;
+            float surfaceMs = _cuttingTool != null ? _cuttingTool.LastSurfaceUpdateMs : 0f;
+            float gpuFlushMs = _cuttingTool != null ? _cuttingTool.LastGpuFlushMs : 0f;
 
             // FPS 颜色标记
             string fpsColor = _fps >= 30 ? "#00FF00" : (_fps >= 15 ? "#FFFF00" : "#FF0000");
@@ -599,8 +1106,11 @@ namespace SurgicalSim
                 $"刀状态: {toolPressed}\n" +
                 $"move: {cutMoveDist:E2}\n" +
                 $"cand/hit: {cutCandidates}/{cutHits}\n" +
+                $"sep/rem: {cutSeparated}/{cutRemainingShared}\n" +
+                $"cut ms q/s/p: {cutQueryMs:F1}/{cutSplitMs:F1}/{cutSeparateMs:F1}\n" +
+                $"surf/gpu: {surfaceMs:F1}/{gpuFlushMs:F1} ms\n" +
                 $"reason: {cutReason}";
-            GUI.Box(new Rect(10, 255, 190, 95), cutDebug, style);
+            GUI.Box(new Rect(10, 255, 230, 145), cutDebug, style);
         }
     }
 }

@@ -5,6 +5,7 @@
 
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace SurgicalSim.Cutting
 {
@@ -13,9 +14,13 @@ namespace SurgicalSim.Cutting
     public class CutSurfaceRenderer : MonoBehaviour
     {
         [Header("切面材质")]
-        public Color cutSurfaceColor = new Color(0.85f, 0.45f, 0.45f, 1f);
-        public float smoothness = 0.3f;
+        public Color cutSurfaceColor = new Color(0.30f, 0.025f, 0.018f, 1f);
+        public float smoothness = 0.66f;
         public float metallic = 0.0f;
+        [Tooltip("Visual vertices on the cut surface are shared only when their patch normals are this close. Keeps straight cuts smooth while preserving sharp S/turn transitions.")]
+        public float normalReuseAngleDeg = 18f;
+        [Tooltip("Runtime visual guard. Triangles with an edge longer than this are hidden so stale cut patches cannot be dragged into long ribbons. 0 disables it.")]
+        public float maxRuntimeEdgeLength = 0.25f;
 
         MeshFilter _meshFilter;
         MeshRenderer _meshRenderer;
@@ -26,7 +31,9 @@ namespace SurgicalSim.Cutting
         List<int>     _allTris  = new List<int>();
         List<Vector3> _allNormals = new List<Vector3>();
         List<int>     _particleIndices = new List<int>();
-        Dictionary<int, int> _particleToVert = new Dictionary<int, int>();
+        Dictionary<int, List<int>> _particleToVerts = new Dictionary<int, List<int>>();
+        readonly List<int> _visibleTris = new List<int>();
+        readonly List<Vector3> _runtimeNormals = new List<Vector3>();
 
         // 每个切面顶点的 tet 嵌入信息（用于跟随变形）
         // embedTetIdx: 顶点所在的 tet 索引
@@ -53,23 +60,66 @@ namespace SurgicalSim.Cutting
         void SetupMaterial()
         {
             // 使用双面渲染的 shader
-            var shader = Shader.Find("SurgicalSim/TwoSidedLiver");
+            var shader = Shader.Find("SurgicalSim/LiverCutSurfaceGPU");
             if (shader == null)
                 shader = Shader.Find("Universal Render Pipeline/Lit");
+            if (shader == null)
+                shader = Shader.Find("Universal Render Pipeline/Unlit");
+            if (shader == null)
+                shader = Shader.Find("Unlit/Color");
+            if (shader == null)
+                shader = Shader.Find("Sprites/Default");
+            if (shader == null)
+                shader = Shader.Find("Standard");
 
             if (shader != null)
             {
                 var mat = new Material(shader);
-                mat.SetColor("_Color", cutSurfaceColor);
-                mat.SetColor("_InteriorColor", cutSurfaceColor);
+                mat.name = "Runtime_CutSurfaceWetTissue";
+                if (mat.HasProperty("_CutColor"))
+                    mat.SetColor("_CutColor", cutSurfaceColor);
+                if (mat.HasProperty("_Color"))
+                    mat.SetColor("_Color", cutSurfaceColor);
+                if (mat.HasProperty("_BaseColor"))
+                    mat.SetColor("_BaseColor", cutSurfaceColor);
+                if (mat.HasProperty("_InteriorColor"))
+                    mat.SetColor("_InteriorColor", cutSurfaceColor);
+                if (mat.HasProperty("_SpecColor"))
+                    mat.SetColor("_SpecColor", Color.black);
+                if (mat.HasProperty("_TextureStrength"))
+                    mat.SetFloat("_TextureStrength", 0f);
+                if (mat.HasProperty("_Roughness"))
+                    mat.SetFloat("_Roughness", Mathf.Clamp01(1f - smoothness));
                 if (mat.HasProperty("_Smoothness"))
                     mat.SetFloat("_Smoothness", smoothness);
+                if (mat.HasProperty("_Glossiness"))
+                    mat.SetFloat("_Glossiness", smoothness);
                 if (mat.HasProperty("_Metallic"))
                     mat.SetFloat("_Metallic", metallic);
+                if (mat.HasProperty("_Wetness"))
+                    mat.SetFloat("_Wetness", 0.78f);
+                if (mat.HasProperty("_SpecularStrength"))
+                    mat.SetFloat("_SpecularStrength", 0.85f);
+                if (mat.HasProperty("_FiberIntensity"))
+                    mat.SetFloat("_FiberIntensity", 0.34f);
+                if (mat.HasProperty("_RimDarkening"))
+                    mat.SetFloat("_RimDarkening", 0.18f);
+                mat.doubleSidedGI = true;
 
                 // 关闭背面剔除
-                mat.SetFloat("_Cull", 0); // Off
+                if (mat.HasProperty("_Cull"))
+                    mat.SetFloat("_Cull", 0); // Off
+                mat.SetOverrideTag("RenderType", "Opaque");
+                mat.renderQueue = (int)RenderQueue.Geometry;
+                if (mat.HasProperty("_Surface"))
+                    mat.SetFloat("_Surface", 0f);
+                if (mat.HasProperty("_Blend"))
+                    mat.SetFloat("_Blend", 0f);
+                if (mat.HasProperty("_ZWrite"))
+                    mat.SetFloat("_ZWrite", 1f);
                 _meshRenderer.material = mat;
+                _meshRenderer.shadowCastingMode = ShadowCastingMode.Off;
+                _meshRenderer.receiveShadows = true;
             }
         }
 
@@ -131,7 +181,8 @@ namespace SurgicalSim.Cutting
                 int pid = particleIds[i];
                 if (pid < 0 || pid >= data.NumParticles) return;
 
-                if (_particleToVert.TryGetValue(pid, out int existingIndex))
+                int existingIndex = FindReusableParticleVertex(pid, patchNormal);
+                if (existingIndex >= 0)
                 {
                     patchIndices[i] = existingIndex;
                     _allNormals[existingIndex] += patchNormal;
@@ -139,7 +190,12 @@ namespace SurgicalSim.Cutting
                 }
 
                 int newIndex = _allVerts.Count;
-                _particleToVert[pid] = newIndex;
+                if (!_particleToVerts.TryGetValue(pid, out var group))
+                {
+                    group = new List<int>(2);
+                    _particleToVerts[pid] = group;
+                }
+                group.Add(newIndex);
                 patchIndices[i] = newIndex;
                 _allVerts.Add(data.Positions[pid]);
                 _allNormals.Add(patchNormal);
@@ -228,10 +284,57 @@ namespace SurgicalSim.Cutting
 
             if (changed && _cutMesh != null)
             {
-                _cutMesh.SetVertices(_allVerts);
-                _cutMesh.RecalculateNormals();
-                _cutMesh.RecalculateBounds();
+                ApplyMeshData();
             }
+        }
+
+        public void SetParticleTriangles(
+            Core.TetMeshData data,
+            IList<int> particleTris,
+            float maxEdgeLength = 0f)
+        {
+            Clear();
+            if (data == null || particleTris == null || particleTris.Count < 3) return;
+
+            float maxEdgeSq = maxEdgeLength > 0f ? maxEdgeLength * maxEdgeLength : 0f;
+            var emittedGeometry = new HashSet<GeometryFaceKey>();
+            int[] tri = new int[3];
+
+            for (int i = 0; i + 2 < particleTris.Count; i += 3)
+            {
+                int a = particleTris[i];
+                int b = particleTris[i + 1];
+                int c = particleTris[i + 2];
+                if (a < 0 || b < 0 || c < 0) continue;
+                if (a >= data.NumParticles || b >= data.NumParticles || c >= data.NumParticles) continue;
+                if (a == b || a == c || b == c) continue;
+
+                Vector3 pa = data.Positions[a];
+                Vector3 pb = data.Positions[b];
+                Vector3 pc = data.Positions[c];
+
+                if (maxEdgeSq > 0f)
+                {
+                    float ab = (pa - pb).sqrMagnitude;
+                    float ac = (pa - pc).sqrMagnitude;
+                    float bc = (pb - pc).sqrMagnitude;
+                    if (ab > maxEdgeSq || ac > maxEdgeSq || bc > maxEdgeSq)
+                        continue;
+                }
+
+                Vector3 normal = Vector3.Cross(pb - pa, pc - pa);
+                if (normal.sqrMagnitude < 1e-12f) continue;
+                if (!emittedGeometry.Add(MakeGeometryFaceKey(pa, pb, pc)))
+                    continue;
+                normal.Normalize();
+
+                tri[0] = a;
+                tri[1] = b;
+                tri[2] = c;
+                AddParticlePatch(data, tri, normal, reverseWinding: false, rebuildMesh: false);
+            }
+
+            RebuildMesh();
         }
 
         /// <summary>
@@ -243,8 +346,10 @@ namespace SurgicalSim.Cutting
             _allTris.Clear();
             _allNormals.Clear();
             _particleIndices.Clear();
-            _particleToVert.Clear();
+            _particleToVerts.Clear();
             _embedInfos.Clear();
+            _visibleTris.Clear();
+            _runtimeNormals.Clear();
 
             if (_cutMesh != null)
             {
@@ -257,32 +362,100 @@ namespace SurgicalSim.Cutting
             _cutMesh.Clear();
 
             if (_allVerts.Count == 0) return;
+            ApplyMeshData();
+        }
+
+        void ApplyMeshData()
+        {
+            if (_cutMesh == null) return;
 
             _cutMesh.SetVertices(_allVerts);
+            BuildVisibleTriangles();
+            _cutMesh.SetTriangles(_visibleTris, 0);
 
-            if (_allNormals.Count == _allVerts.Count)
-            {
-                for (int i = 0; i < _allNormals.Count; i++)
-                {
-                    if (_allNormals[i].sqrMagnitude < 1e-10f)
-                        _allNormals[i] = Vector3.up;
-                    else
-                        _allNormals[i].Normalize();
-                }
-                _cutMesh.SetNormals(_allNormals);
-            }
-
-            _cutMesh.SetTriangles(_allTris, 0);
-
-            if (_allNormals.Count != _allVerts.Count)
-                _cutMesh.RecalculateNormals();
+            RebuildRuntimeNormals();
+            _cutMesh.SetNormals(_runtimeNormals);
 
             _cutMesh.RecalculateBounds();
+        }
+
+        void BuildVisibleTriangles()
+        {
+            _visibleTris.Clear();
+            float maxEdgeSq = maxRuntimeEdgeLength > 0f
+                ? maxRuntimeEdgeLength * maxRuntimeEdgeLength
+                : 0f;
+            var emittedGeometry = new HashSet<GeometryFaceKey>();
+
+            for (int i = 0; i + 2 < _allTris.Count; i += 3)
+            {
+                int a = _allTris[i];
+                int b = _allTris[i + 1];
+                int c = _allTris[i + 2];
+                if (a < 0 || b < 0 || c < 0) continue;
+                if (a >= _allVerts.Count || b >= _allVerts.Count || c >= _allVerts.Count) continue;
+
+                if (maxEdgeSq > 0f)
+                {
+                    Vector3 pa = _allVerts[a];
+                    Vector3 pb = _allVerts[b];
+                    Vector3 pc = _allVerts[c];
+                    if ((pa - pb).sqrMagnitude > maxEdgeSq ||
+                        (pa - pc).sqrMagnitude > maxEdgeSq ||
+                        (pb - pc).sqrMagnitude > maxEdgeSq)
+                    {
+                        continue;
+                    }
+                }
+
+                if (!emittedGeometry.Add(MakeGeometryFaceKey(_allVerts[a], _allVerts[b], _allVerts[c])))
+                    continue;
+
+                _visibleTris.Add(a);
+                _visibleTris.Add(b);
+                _visibleTris.Add(c);
+            }
+        }
+
+        void RebuildRuntimeNormals()
+        {
+            _runtimeNormals.Clear();
+            for (int i = 0; i < _allVerts.Count; i++)
+            {
+                Vector3 n = i < _allNormals.Count && _allNormals[i].sqrMagnitude > 1e-10f
+                    ? _allNormals[i].normalized
+                    : Vector3.up;
+                _runtimeNormals.Add(n);
+            }
         }
 
         public void RebuildNow()
         {
             RebuildMesh();
+        }
+
+        int FindReusableParticleVertex(int particleId, Vector3 patchNormal)
+        {
+            if (!_particleToVerts.TryGetValue(particleId, out var group)) return -1;
+
+            Vector3 n = patchNormal.sqrMagnitude > 1e-10f
+                ? patchNormal.normalized
+                : Vector3.up;
+            float minDot = Mathf.Cos(Mathf.Max(0f, normalReuseAngleDeg) * Mathf.Deg2Rad);
+
+            for (int i = 0; i < group.Count; i++)
+            {
+                int candidate = group[i];
+                if (candidate < 0 || candidate >= _allNormals.Count) continue;
+
+                Vector3 existing = _allNormals[candidate];
+                if (existing.sqrMagnitude < 1e-10f) continue;
+                existing.Normalize();
+                if (Vector3.Dot(existing, n) >= minDot)
+                    return candidate;
+            }
+
+            return -1;
         }
 
         /// <summary>
@@ -294,5 +467,111 @@ namespace SurgicalSim.Cutting
         /// 切面三角形数
         /// </summary>
         public int TriangleCount => _allTris.Count / 3;
+
+        static GeometryFaceKey MakeGeometryFaceKey(Vector3 a, Vector3 b, Vector3 c)
+        {
+            return new GeometryFaceKey(
+                QuantizedPoint(a),
+                QuantizedPoint(b),
+                QuantizedPoint(c));
+        }
+
+        static PointKey QuantizedPoint(Vector3 p)
+        {
+            const float invTol = 100000f;
+            return new PointKey(
+                Mathf.RoundToInt(p.x * invTol),
+                Mathf.RoundToInt(p.y * invTol),
+                Mathf.RoundToInt(p.z * invTol));
+        }
+
+        struct GeometryFaceKey : System.IEquatable<GeometryFaceKey>
+        {
+            readonly PointKey a;
+            readonly PointKey b;
+            readonly PointKey c;
+
+            public GeometryFaceKey(PointKey p0, PointKey p1, PointKey p2)
+            {
+                if (Compare(p1, p0) < 0) Swap(ref p0, ref p1);
+                if (Compare(p2, p1) < 0) Swap(ref p1, ref p2);
+                if (Compare(p1, p0) < 0) Swap(ref p0, ref p1);
+
+                a = p0;
+                b = p1;
+                c = p2;
+            }
+
+            public bool Equals(GeometryFaceKey other)
+            {
+                return a.Equals(other.a) && b.Equals(other.b) && c.Equals(other.c);
+            }
+
+            public override bool Equals(object obj)
+            {
+                return obj is GeometryFaceKey other && Equals(other);
+            }
+
+            public override int GetHashCode()
+            {
+                unchecked
+                {
+                    int hash = a.GetHashCode();
+                    hash = hash * 397 ^ b.GetHashCode();
+                    hash = hash * 397 ^ c.GetHashCode();
+                    return hash;
+                }
+            }
+
+            static int Compare(PointKey x, PointKey y)
+            {
+                if (x.x != y.x) return x.x < y.x ? -1 : 1;
+                if (x.y != y.y) return x.y < y.y ? -1 : 1;
+                if (x.z != y.z) return x.z < y.z ? -1 : 1;
+                return 0;
+            }
+
+            static void Swap(ref PointKey x, ref PointKey y)
+            {
+                PointKey tmp = x;
+                x = y;
+                y = tmp;
+            }
+        }
+
+        struct PointKey : System.IEquatable<PointKey>
+        {
+            public readonly int x;
+            public readonly int y;
+            public readonly int z;
+
+            public PointKey(int x, int y, int z)
+            {
+                this.x = x;
+                this.y = y;
+                this.z = z;
+            }
+
+            public bool Equals(PointKey other)
+            {
+                return x == other.x && y == other.y && z == other.z;
+            }
+
+            public override bool Equals(object obj)
+            {
+                return obj is PointKey other && Equals(other);
+            }
+
+            public override int GetHashCode()
+            {
+                unchecked
+                {
+                    int hash = x;
+                    hash = hash * 397 ^ y;
+                    hash = hash * 397 ^ z;
+                    return hash;
+                }
+            }
+        }
     }
 }

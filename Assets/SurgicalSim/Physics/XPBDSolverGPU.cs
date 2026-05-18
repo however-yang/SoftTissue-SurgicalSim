@@ -102,6 +102,7 @@ namespace SurgicalSim.Physics
             Vector4[] invRestMat = new Vector4[_numT * 3]; // 3 rows per tet
             float[] alphaDev    = new float[_numT];
             float[] alphaHyd    = new float[_numT];
+            const float minVolForConstraint = 1e-10f;
 
             for (int i = 0; i < _numT; i++)
             {
@@ -117,7 +118,16 @@ namespace SurgicalSim.Physics
                 float vol = Mathf.Abs(det) / 6f;
                 restVolumes[i] = vol;
 
-                if (Mathf.Abs(det) < 1e-12f)
+                float avgMass = Density * vol / 4f;
+                mass[id0] += avgMass;
+                mass[id1] += avgMass;
+                mass[id2] += avgMass;
+                mass[id3] += avgMass;
+
+                // Very small child tets are topological bookkeeping for a
+                // zero-width cut, not stable Neo-Hookean elements. Edge
+                // constraints still keep them connected without huge gradients.
+                if (Mathf.Abs(det) < 1e-12f || vol < minVolForConstraint)
                 {
                     invRestMat[i*3+0] = Vector4.zero;
                     invRestMat[i*3+1] = Vector4.zero;
@@ -137,18 +147,11 @@ namespace SurgicalSim.Physics
                 invRestMat[i*3+2] = new Vector4(r2.x, r2.y, r2.z, 0);
 
                 // 累加质量 (参考 FantasyVR: mass[a] += density * V / 4)
-                float avgMass = Density * vol / 4f;
-                mass[id0] += avgMass;
-                mass[id1] += avgMass;
-                mass[id2] += avgMass;
-                mass[id3] += avgMass;
-
                 // alpha = 1/(h^2 * mu * V)
                 float h = Time.fixedDeltaTime;  // ~0.02
                 float inv_h2 = 1f / (h * h);
 
                 // ★ 跳过极小体积 tet 的约束（防止 alpha 爆炸）
-                float minVolForConstraint = 1e-10f;
                 if (vol < minVolForConstraint)
                 {
                     alphaDev[i] = 0f;
@@ -167,28 +170,63 @@ namespace SurgicalSim.Physics
             }
 
             // mass → invMass
-            // ★ 修复: 零质量但非固定的粒子给一个合理默认值
-            float avgInvMass = 0f;
-            int   avgCount   = 0;
+            // ★ Step 3 (cut debris fix): compute the average MASS
+            // (not invMass) using the median-ish "robust" mean, then
+            // enforce a hard mass floor at avgMass / 100 to absolutely
+            // bound the worst-case inverse mass. Averaging invMass
+            // directly is non-robust: a single 1e-11 m^3 sliver tet
+            // produces an invMass of ~4e+8 which then drives
+            // fallbackInvMass into the 1e+7 range and lets the
+            // fallbackInvMass*10 clamp accept invMasses up to 1e+8.
+            // The observed [SepDiag InvMass max=3.478E+08] is exactly
+            // that failure mode.
+            float sumParticleMass = 0f;
+            int countParticleMass = 0;
             for (int i = 0; i < _numP; i++)
             {
-                if (data.InvMass[i] == 0f) continue; // 固定点
+                if (data.InvMass[i] == 0f) continue;
                 if (mass[i] > 1e-12f)
                 {
-                    avgInvMass += 1f / mass[i];
-                    avgCount++;
+                    sumParticleMass += mass[i];
+                    countParticleMass++;
                 }
             }
-            float fallbackInvMass = avgCount > 0 ? avgInvMass / avgCount : 1f;
+            float avgParticleMass = countParticleMass > 0 ? sumParticleMass / countParticleMass : 1f;
+            // ★ Step 4 (XPBD conditioning): tighten the mass floor to
+            // avgMass * 0.1. With the previous 0.01 factor the invMass
+            // ratio max/min could still reach ~10000:1, which the
+            // GPU XPBD constraint solver cannot handle gracefully --
+            // heavy particles get accelerated into light neighbours
+            // and the cut surface ends up with the "tassel / pin-hole"
+            // pattern observed in the screenshot. 0.1 caps the ratio
+            // at ~100:1, well inside the well-conditioned regime, at
+            // the cost of treating sliver-incident particles as if
+            // they were slightly heavier than their (post-cut) tets
+            // would assign. This is acceptable because sliver tets are
+            // physical artefacts of the cutting algorithm anyway, not
+            // a faithful sampling of the material distribution.
+            float minReasonableMass = avgParticleMass * 0.1f;
 
+            int massFloorHits = 0;
             for (int i = 0; i < _numP; i++)
             {
                 if (data.InvMass[i] == 0f)
-                    invMass[i] = 0f;  // 固定点
-                else if (mass[i] > 1e-12f)
-                    invMass[i] = Mathf.Min(1f / mass[i], fallbackInvMass * 10f); // ★ 钳位极端值
-                else
-                    invMass[i] = fallbackInvMass; // ★ 零质量非固定 → 用平均值
+                {
+                    invMass[i] = 0f;
+                    continue;
+                }
+                float m = mass[i];
+                if (m < minReasonableMass)
+                {
+                    m = minReasonableMass;
+                    massFloorHits++;
+                }
+                invMass[i] = 1f / m;
+            }
+            if (massFloorHits > 0)
+            {
+                Debug.Log($"[XPBDSolverGPU] mass floor applied to {massFloorHits} particles " +
+                          $"(avgParticleMass={avgParticleMass:G4}, floor={minReasonableMass:G4})");
             }
 
             // ── 建边 ─────────────────────────────────────────

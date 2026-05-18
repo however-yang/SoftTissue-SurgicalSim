@@ -59,22 +59,29 @@ Shader "SurgicalSim/TwoSidedLiver"
                 float _TriplanarBlend;
             CBUFFER_END
 
+            float3 SafeNormalize3(float3 v, float3 fallback)
+            {
+                float lenSq = dot(v, v);
+                return lenSq > 1e-12 ? v * rsqrt(lenSq) : fallback;
+            }
+
             Varyings vert(Attributes input)
             {
                 Varyings output;
                 VertexPositionInputs vpi = GetVertexPositionInputs(input.positionOS.xyz);
+                float3 normalOS = SafeNormalize3(input.normalOS, float3(0.0, 1.0, 0.0));
                 output.positionCS = vpi.positionCS;
                 output.positionWS = vpi.positionWS;
                 output.positionOS = input.positionOS.xyz;
-                output.normalOS = normalize(input.normalOS);
+                output.normalOS = normalOS;
                 output.restOS = input.restOS;
-                output.normalWS = TransformObjectToWorldNormal(input.normalOS);
+                output.normalWS = SafeNormalize3(TransformObjectToWorldNormal(normalOS), float3(0.0, 1.0, 0.0));
                 return output;
             }
 
             half3 SampleLiverTriplanar(float3 positionOS, float3 normalOS)
             {
-                float3 weights = abs(normalize(normalOS));
+                float3 weights = abs(SafeNormalize3(normalOS, float3(0.0, 1.0, 0.0)));
                 weights = max(weights, float3(1e-4, 1e-4, 1e-4));
                 float blend = max(_TriplanarBlend, 1e-3);
                 weights = pow(weights, float3(blend, blend, blend));
@@ -97,17 +104,33 @@ Shader "SurgicalSim/TwoSidedLiver"
 
             half4 frag(Varyings input, half facing : VFACE) : SV_Target
             {
-                float3 normal = normalize(input.normalWS) * facing;
+                float3 geometricNormal = SafeNormalize3(
+                    cross(ddx(input.positionWS), ddy(input.positionWS)),
+                    float3(0.0, 1.0, 0.0));
+                float3 vertexNormal = SafeNormalize3(input.normalWS, geometricNormal);
+                if (dot(vertexNormal, geometricNormal) < -0.25)
+                    vertexNormal = -vertexNormal;
+                float3 normal = SafeNormalize3(vertexNormal * facing, geometricNormal);
 
                 half3 texColor = SampleLiverTriplanar(input.restOS, input.normalOS);
-                half3 surfaceAlbedo = lerp(_Color.rgb, texColor, saturate(_TextureStrength));
-                half3 albedo = (facing > 0) ? surfaceAlbedo : _InteriorColor.rgb;
+                half3 minSurface = saturate(_Color.rgb * 0.35 + 0.04);
+                texColor = max(texColor, minSurface);
+                half3 surfaceAlbedo = max(
+                    lerp(_Color.rgb, texColor, saturate(_TextureStrength)),
+                    minSurface);
+                // Main liver mesh renders only the original exterior surface.
+                // Explicit cut faces are drawn by CutSurfaceRenderer, so backfaces
+                // here must stay liver-colored instead of becoming interior patches.
+                half3 albedo = surfaceAlbedo;
 
                 Light mainLight = GetMainLight();
                 float NdotL = saturate(dot(normal, mainLight.direction));
+                NdotL = max(NdotL, 0.18);
 
-                float3 ambient = albedo * 0.3;
-                float3 diffuse = albedo * mainLight.color.rgb * NdotL * 0.7;
+                float ambientStrength = 0.50;
+                float diffuseStrength = 0.50;
+                float3 ambient = albedo * ambientStrength;
+                float3 diffuse = albedo * mainLight.color.rgb * NdotL * diffuseStrength;
 
                 float3 viewDir = GetWorldSpaceNormalizeViewDir(input.positionWS);
                 float3 halfDir = normalize(mainLight.direction + viewDir);
