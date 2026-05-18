@@ -367,7 +367,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 201863034a73ff24d820f440899c85e6, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  jsonFileName: liver3-HD.json
+  jsonFileName: liver3_refined_1.json
   autoLoad: 1
   massDensity: 1050
   meshScale: 1.5
@@ -414,6 +414,10 @@ MonoBehaviour:
   groundY: -3
   createGroundPlane: 1
   groundColor: {r: 0.3, g: 0.7, b: 0.3, a: 0.8}
+  toolContactDistance: 0.006
+  toolContactCompliance: 0.000002
+  toolContactIterations: 4
+  toolContactCouplingPasses: 3
   enableCutting: 1
   cutRadius: 0.0047
   virtualBladeRadius: 0.0025

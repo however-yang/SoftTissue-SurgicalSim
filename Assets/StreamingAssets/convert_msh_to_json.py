@@ -16,13 +16,27 @@ from collections import defaultdict
 
 
 def parse_msh(filepath):
-    """Parse Gmsh 2.2 ASCII format."""
+    """Parse Gmsh 2.2 or 4.1 ASCII format."""
     with open(filepath, 'r') as f:
         lines = f.readlines()
 
     # Strip \r\n
     lines = [l.strip() for l in lines]
 
+    version = None
+    for i, line in enumerate(lines):
+        if line == '$MeshFormat' and i + 1 < len(lines):
+            version = lines[i + 1].split()[0]
+            break
+
+    if version and version.startswith('4.'):
+        return parse_msh_41(lines)
+
+    return parse_msh_22(lines)
+
+
+def parse_msh_22(lines):
+    """Parse Gmsh 2.2 ASCII format."""
     nodes = {}
     elements = []
 
@@ -60,6 +74,86 @@ def parse_msh(filepath):
                 i += 1
             # skip $EndElements
             i += 1
+            continue
+
+        i += 1
+
+    return nodes, elements
+
+
+def parse_msh_41(lines):
+    """Parse Gmsh 4.1 ASCII format."""
+    nodes = {}
+    elements = []
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        if line == '$Nodes':
+            i += 1
+            header = [int(v) for v in lines[i].split()]
+            if len(header) < 4:
+                raise ValueError('Invalid Gmsh 4.1 $Nodes header')
+            num_entity_blocks, num_nodes = header[0], header[1]
+            i += 1
+
+            for _ in range(num_entity_blocks):
+                block_header = [int(v) for v in lines[i].split()]
+                if len(block_header) < 4:
+                    raise ValueError('Invalid Gmsh 4.1 node block header')
+                parametric = block_header[2]
+                num_nodes_in_block = block_header[3]
+                i += 1
+
+                node_tags = []
+                while len(node_tags) < num_nodes_in_block:
+                    node_tags.extend(int(v) for v in lines[i].split())
+                    i += 1
+
+                for local_idx in range(num_nodes_in_block):
+                    parts = lines[i].split()
+                    if len(parts) < 3:
+                        raise ValueError('Invalid Gmsh 4.1 node coordinate line')
+                    x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
+                    nodes[node_tags[local_idx]] = (x, y, z)
+                    i += 1
+                    if parametric:
+                        # Coordinates and parametric coordinates are on the
+                        # same line in ASCII 4.1; the first three values are
+                        # always Cartesian xyz, which is all we need.
+                        pass
+
+            if len(nodes) != num_nodes:
+                print(f"Warning: parsed {len(nodes)} nodes, header declared {num_nodes}")
+            if i < len(lines) and lines[i] == '$EndNodes':
+                i += 1
+            continue
+
+        if line == '$Elements':
+            i += 1
+            header = [int(v) for v in lines[i].split()]
+            if len(header) < 4:
+                raise ValueError('Invalid Gmsh 4.1 $Elements header')
+            num_entity_blocks = header[0]
+            i += 1
+
+            for _ in range(num_entity_blocks):
+                block_header = [int(v) for v in lines[i].split()]
+                if len(block_header) < 4:
+                    raise ValueError('Invalid Gmsh 4.1 element block header')
+                element_type = block_header[2]
+                num_elements_in_block = block_header[3]
+                i += 1
+
+                for _ in range(num_elements_in_block):
+                    parts = [int(v) for v in lines[i].split()]
+                    node_ids = parts[1:]
+                    elements.append((element_type, node_ids))
+                    i += 1
+
+            if i < len(lines) and lines[i] == '$EndElements':
+                i += 1
             continue
 
         i += 1

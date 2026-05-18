@@ -17,6 +17,11 @@ namespace SurgicalSim.Grasping
 {
     public class GripperTool : MonoBehaviour
     {
+        const float FourXModelScale = 0.01f;
+        const float FourXCollisionMargin = FourXModelScale * 1.5f;
+        const float FourXJawCapsuleRadius = FourXModelScale * 3.2f;
+        const float FourXShaftCapsuleRadius = FourXModelScale * 2.8f;
+
         [Header("OBJ 模型文件")]
         public string jawUpVisual   = "Haptic_grasper_jaws_up.obj";
         public string jawDownVisual = "Haptic_grasper_jaws_down.obj";
@@ -26,18 +31,21 @@ namespace SurgicalSim.Grasping
         public string shaftCol      = "Haptic_grasper_shaft_collision.obj";
 
         [Header("模型参数")]
-        [Tooltip("OBJ 单位到世界单位的缩放 (默认放大3倍: 0.003)")]
-        public float modelScale = 0.003f;
+        [Tooltip("OBJ unit to world scale. Current preset keeps the enlarged visual gripper at 0.01.")]
+        public float modelScale = FourXModelScale;
+
+        [Tooltip("Apply the calibrated enlarged visual/collision gripper preset at runtime.")]
+        public bool useFourXGripperPreset = true;
 
         [Header("物理参数")]
         [Tooltip("碰撞 AABB 外扩边距 (m)")]
-        public float collisionMargin = 0.03f;
+        public float collisionMargin = FourXCollisionMargin;
 
-        [Tooltip("颚面胶囊体半径 (m)，必须大于最近粒子距离(~0.055)才能生效")]
-        public float capsuleRadius = 0.06f;
+        [Tooltip("Jaw capsule contact radius (m). Kept close to the visual jaw thickness to avoid oversized dents.")]
+        public float capsuleRadius = FourXJawCapsuleRadius;
 
         [Tooltip("杆身胶囊体半径 (m)，防止杆身穿模")]
-        public float shaftRadius = 0.04f;
+        public float shaftRadius = FourXShaftCapsuleRadius;
 
         [Tooltip("显示碰撞胶囊体 Gizmo")]
         public bool showCapsuleGizmo = true;
@@ -109,6 +117,8 @@ namespace SurgicalSim.Grasping
             _solver = solver;
             _visualizer = visualizer;
 
+            ApplyGripperScalePreset();
+
             _toolPos = new Vector3(0.15f, 0.5f, 0f);
             _toolRotY = 0f;
             _currentAngle = maxOpenAngle; // 初始张开
@@ -132,6 +142,16 @@ namespace SurgicalSim.Grasping
             _initialized = true;
 
             Debug.Log($"[GripperTool] Init | scale={modelScale} | 3-capsule collision");
+        }
+
+        void ApplyGripperScalePreset()
+        {
+            if (!useFourXGripperPreset) return;
+
+            modelScale = FourXModelScale;
+            collisionMargin = FourXCollisionMargin;
+            capsuleRadius = FourXJawCapsuleRadius;
+            shaftRadius = FourXShaftCapsuleRadius;
         }
 
         // ══════════════════════════════════════════════════════

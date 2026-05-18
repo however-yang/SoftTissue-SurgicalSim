@@ -66,13 +66,13 @@ namespace SurgicalSim
 
         [Header("Tool Contact")]
         [Range(0.001f, 0.08f)]
-        public float toolContactDistance = 0.01f;
+        public float toolContactDistance = 0.006f;
         [Range(0f, 1e-4f)]
-        public float toolContactCompliance = 1e-7f;
+        public float toolContactCompliance = 2e-6f;
         [Range(1, 8)]
-        public int toolContactIterations = 2;
+        public int toolContactIterations = 4;
         [Range(1, 4)]
-        public int toolContactCouplingPasses = 2;
+        public int toolContactCouplingPasses = 3;
 
         [Header("切割")]
         [Tooltip("啟用鼠標拖拽切割")]
