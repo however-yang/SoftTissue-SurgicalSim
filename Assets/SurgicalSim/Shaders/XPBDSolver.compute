@@ -7,6 +7,7 @@
 #pragma kernel CSSolveEdges
 #pragma kernel CSSolveNeoHookeanDev
 #pragma kernel CSSolveNeoHookeanHyd
+#pragma kernel CSSolveNeoHookeanDevHyd
 #pragma kernel CSPostSolve
 #pragma kernel CSGroundCollision
 #pragma kernel CSToolCollision
@@ -321,6 +322,138 @@ void CSSolveNeoHookeanHyd(uint3 id : SV_DispatchThreadID)
 // ═══════════════════════════════════════════════════════
 // Kernel 4: PostSolve（速度更新 + 阻尼）
 // ═══════════════════════════════════════════════════════
+// Fused NeoHookean support: same per-tet dev -> hyd sequence, fewer dispatches.
+void SolveNeoHookeanDevTet(uint t)
+{
+    if (t >= _NumTets) return;
+    if (_TetActive[t] == 0) return;
+
+    uint4 ids = _TetIds[t];
+    float3 p0 = _Positions[ids.x].xyz;
+    float3 p1 = _Positions[ids.y].xyz;
+    float3 p2 = _Positions[ids.z].xyz;
+    float3 p3 = _Positions[ids.w].xyz;
+
+    float3 e1 = p1 - p0;
+    float3 e2 = p2 - p0;
+    float3 e3 = p3 - p0;
+
+    float3x3 B = LoadInvRestMatrix(t);
+    float3x3 Ds = float3x3(
+        e1.x, e2.x, e3.x,
+        e1.y, e2.y, e3.y,
+        e1.z, e2.z, e3.z
+    );
+    float3x3 F = mul(Ds, B);
+
+    float rs = dot(F[0], F[0]) + dot(F[1], F[1]) + dot(F[2], F[2]);
+    float constraint = rs - 3.0;
+
+    float3x3 BT = transpose(B);
+    float3x3 G = mul(F, BT) * 2.0;
+
+    float3 g1 = float3(G[0][0], G[1][0], G[2][0]);
+    float3 g2 = float3(G[0][1], G[1][1], G[2][1]);
+    float3 g3 = float3(G[0][2], G[1][2], G[2][2]);
+    float3 g0 = -(g1 + g2 + g3);
+
+    float w0 = _InvMasses[ids.x];
+    float w1 = _InvMasses[ids.y];
+    float w2 = _InvMasses[ids.z];
+    float w3 = _InvMasses[ids.w];
+
+    float sumW = w0 * dot(g0, g0) + w1 * dot(g1, g1) +
+                 w2 * dot(g2, g2) + w3 * dot(g3, g3);
+
+    float denom = sumW + _AlphaDeviatoric[t];
+    if (denom < 1e-10) return;
+
+    float dlambda = -constraint / denom * _Omega;
+    if (isnan(dlambda) || isinf(dlambda)) return;
+
+    _Positions[ids.x] = float4(p0 + w0 * dlambda * g0, 0);
+    _Positions[ids.y] = float4(p1 + w1 * dlambda * g1, 0);
+    _Positions[ids.z] = float4(p2 + w2 * dlambda * g2, 0);
+    _Positions[ids.w] = float4(p3 + w3 * dlambda * g3, 0);
+}
+
+void SolveNeoHookeanHydTet(uint t)
+{
+    if (t >= _NumTets) return;
+    if (_TetActive[t] == 0) return;
+
+    uint4 ids = _TetIds[t];
+    float3 p0 = _Positions[ids.x].xyz;
+    float3 p1 = _Positions[ids.y].xyz;
+    float3 p2 = _Positions[ids.z].xyz;
+    float3 p3 = _Positions[ids.w].xyz;
+
+    float3 e1 = p1 - p0;
+    float3 e2 = p2 - p0;
+    float3 e3 = p3 - p0;
+
+    float3x3 B = LoadInvRestMatrix(t);
+    float3x3 Ds = float3x3(
+        e1.x, e2.x, e3.x,
+        e1.y, e2.y, e3.y,
+        e1.z, e2.z, e3.z
+    );
+    float3x3 F = mul(Ds, B);
+
+    float3 f1 = float3(F[0][0], F[1][0], F[2][0]);
+    float3 f2 = float3(F[0][1], F[1][1], F[2][1]);
+    float3 f3 = float3(F[0][2], F[1][2], F[2][2]);
+
+    float3 df0 = cross(f2, f3);
+    float3 df1 = cross(f3, f1);
+    float3 df2 = cross(f1, f2);
+
+    float3x3 cofM = float3x3(
+        df0.x, df1.x, df2.x,
+        df0.y, df1.y, df2.y,
+        df0.z, df1.z, df2.z
+    );
+    float3x3 BT = transpose(B);
+    float3x3 G = mul(cofM, BT);
+
+    float3 g1 = float3(G[0][0], G[1][0], G[2][0]);
+    float3 g2 = float3(G[0][1], G[1][1], G[2][1]);
+    float3 g3 = float3(G[0][2], G[1][2], G[2][2]);
+    float3 g0 = -(g1 + g2 + g3);
+
+    float constraint = det3x3(F) - 1.0;
+
+    float w0 = _InvMasses[ids.x];
+    float w1 = _InvMasses[ids.y];
+    float w2 = _InvMasses[ids.z];
+    float w3 = _InvMasses[ids.w];
+
+    float sumW = w0 * dot(g0, g0) + w1 * dot(g1, g1) +
+                 w2 * dot(g2, g2) + w3 * dot(g3, g3);
+
+    float denom = sumW + _AlphaHydrostatic[t];
+    if (denom < 1e-10) return;
+
+    float dlambda = -constraint / denom * _Omega;
+    if (isnan(dlambda) || isinf(dlambda)) return;
+
+    _Positions[ids.x] = float4(p0 + w0 * dlambda * g0, 0);
+    _Positions[ids.y] = float4(p1 + w1 * dlambda * g1, 0);
+    _Positions[ids.z] = float4(p2 + w2 * dlambda * g2, 0);
+    _Positions[ids.w] = float4(p3 + w3 * dlambda * g3, 0);
+}
+
+[numthreads(64,1,1)]
+void CSSolveNeoHookeanDevHyd(uint3 id : SV_DispatchThreadID)
+{
+    uint li = id.x;
+    if (li >= _GroupCount) return;
+
+    uint t = (uint)_ColorGroupFlat[_GroupOffset + li];
+    SolveNeoHookeanDevTet(t);
+    SolveNeoHookeanHydTet(t);
+}
+
 [numthreads(64,1,1)]
 void CSPostSolve(uint3 id : SV_DispatchThreadID)
 {
@@ -638,6 +771,29 @@ void EvaluateSweptTriCapsuleContact(
     EvaluateTriCapsuleContact(a, b, c, prevB, capB, capR, bestC, bestNormal, bestBary);
 }
 
+bool TriAabbOverlapsCapsuleSweep(
+    float3 triMin, float3 triMax,
+    float3 capA, float3 capB, float3 prevA, float3 prevB, float capR)
+{
+    float shell = capR + _ToolContactDistance;
+    float3 capMin = min(min(capA, capB), min(prevA, prevB)) - shell;
+    float3 capMax = max(max(capA, capB), max(prevA, prevB)) + shell;
+    return !(any(triMax < capMin) || any(triMin > capMax));
+}
+
+void EvaluateSweptTriCapsuleContactFiltered(
+    float3 a, float3 b, float3 c, float3 triMin, float3 triMax,
+    float3 capA, float3 capB, float3 prevA, float3 prevB, float capR,
+    inout float bestC, inout float3 bestNormal, inout float3 bestBary)
+{
+    if (!TriAabbOverlapsCapsuleSweep(triMin, triMax, capA, capB, prevA, prevB, capR))
+        return;
+
+    EvaluateSweptTriCapsuleContact(
+        a, b, c, capA, capB, prevA, prevB, capR,
+        bestC, bestNormal, bestBary);
+}
+
 [numthreads(64,1,1)]
 void CSSolveSurfaceToolContacts(uint3 id : SV_DispatchThreadID)
 {
@@ -659,6 +815,10 @@ void CSSolveSurfaceToolContacts(uint3 id : SV_DispatchThreadID)
     float3 p0 = _Positions[ids.x].xyz;
     float3 p1 = _Positions[ids.y].xyz;
     float3 p2 = _Positions[ids.z].xyz;
+    float3 triMin = min(p0, min(p1, p2));
+    float3 triMax = max(p0, max(p1, p2));
+    if (any(triMax < _ToolBBoxMin.xyz) || any(triMin > _ToolBBoxMax.xyz))
+        return;
 
     float3 prev0 = _PrevPositions[ids.x].xyz;
     float3 prev1 = _PrevPositions[ids.y].xyz;
@@ -671,11 +831,11 @@ void CSSolveSurfaceToolContacts(uint3 id : SV_DispatchThreadID)
         float3 bestBary = float3(0.0, 0.0, 0.0);
 
         if (numCapsules >= 1)
-            EvaluateSweptTriCapsuleContact(p0, p1, p2, _Capsule0A.xyz, _Capsule0B.xyz, _PrevCapsule0A.xyz, _PrevCapsule0B.xyz, _Capsule0A.w, bestC, bestNormal, bestBary);
+            EvaluateSweptTriCapsuleContactFiltered(p0, p1, p2, triMin, triMax, _Capsule0A.xyz, _Capsule0B.xyz, _PrevCapsule0A.xyz, _PrevCapsule0B.xyz, _Capsule0A.w, bestC, bestNormal, bestBary);
         if (numCapsules >= 2)
-            EvaluateSweptTriCapsuleContact(p0, p1, p2, _Capsule1A.xyz, _Capsule1B.xyz, _PrevCapsule1A.xyz, _PrevCapsule1B.xyz, _Capsule1A.w, bestC, bestNormal, bestBary);
+            EvaluateSweptTriCapsuleContactFiltered(p0, p1, p2, triMin, triMax, _Capsule1A.xyz, _Capsule1B.xyz, _PrevCapsule1A.xyz, _PrevCapsule1B.xyz, _Capsule1A.w, bestC, bestNormal, bestBary);
         if (numCapsules >= 3)
-            EvaluateSweptTriCapsuleContact(p0, p1, p2, _Capsule2A.xyz, _Capsule2B.xyz, _PrevCapsule2A.xyz, _PrevCapsule2B.xyz, _Capsule2A.w, bestC, bestNormal, bestBary);
+            EvaluateSweptTriCapsuleContactFiltered(p0, p1, p2, triMin, triMax, _Capsule2A.xyz, _Capsule2B.xyz, _PrevCapsule2A.xyz, _PrevCapsule2B.xyz, _Capsule2A.w, bestC, bestNormal, bestBary);
 
         if (bestC >= 0.0)
             break;

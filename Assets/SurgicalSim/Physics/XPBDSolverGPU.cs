@@ -24,7 +24,7 @@ namespace SurgicalSim.Physics
 
         // ── GPU 资源 ─────────────────────────────────────────
         readonly ComputeShader _cs;
-        int _kIntegrate, _kSolveEdges, _kSolveNHDev, _kSolveNHHyd,
+        int _kIntegrate, _kSolveEdges, _kSolveNHDev, _kSolveNHHyd, _kSolveNHDevHyd,
             _kPostSolve, _kGroundCollision, _kToolCollision,
             _kSolveSurfaceToolContacts;
 
@@ -47,11 +47,21 @@ namespace SurgicalSim.Physics
 
         List<int>[] _edgeToTets;
         int[] _surfaceGroupOff, _surfaceGroupCnt; int _numSurfaceColors;
+        int _activeToolCapsules;
 
         public float ToolContactDistance = 0.01f;
         public float ToolContactCompliance = 1e-7f;
         public int ToolContactIterations = 2;
         public int ToolContactCouplingPasses = 2;
+        public int ActiveToolCapsules => _activeToolCapsules;
+        public int InternalDispatchesPerPass => _numEdgeColors + _numColors;
+        public int EstimatedInternalDispatchesPerFrame =>
+            NumSubSteps * (1 + Mathf.Max(1, ToolContactCouplingPasses)) * InternalDispatchesPerPass;
+        public int EstimatedToolContactDispatchesPerFrame =>
+            _activeToolCapsules > 0
+                ? NumSubSteps * (1 + Mathf.Max(1, ToolContactCouplingPasses)) *
+                  Mathf.Max(1, ToolContactIterations) * _numSurfaceColors
+                : 0;
 
         [System.Runtime.InteropServices.StructLayout(
             System.Runtime.InteropServices.LayoutKind.Sequential)]
@@ -70,6 +80,7 @@ namespace SurgicalSim.Physics
             _kSolveEdges     = _cs.FindKernel("CSSolveEdges");
             _kSolveNHDev     = _cs.FindKernel("CSSolveNeoHookeanDev");
             _kSolveNHHyd     = _cs.FindKernel("CSSolveNeoHookeanHyd");
+            _kSolveNHDevHyd  = _cs.FindKernel("CSSolveNeoHookeanDevHyd");
             _kPostSolve      = _cs.FindKernel("CSPostSolve");
             _kGroundCollision = _cs.FindKernel("CSGroundCollision");
             _kToolCollision   = _cs.FindKernel("CSToolCollision");
@@ -85,6 +96,7 @@ namespace SurgicalSim.Physics
             _numP = data.NumParticles;
             _numT = data.NumTets;
             _numSurfaceTris = data.NumSurfaceTris;
+            _activeToolCapsules = 0;
 
             // Lamé 参数
             float E = YoungsModulus;
@@ -374,8 +386,7 @@ namespace SurgicalSim.Physics
                     {
                         _cs.SetInt("_GroupOffset", _groupOff[c]);
                         _cs.SetInt("_GroupCount",  _groupCnt[c]);
-                        Go(_kSolveNHDev, _groupCnt[c]);
-                        Go(_kSolveNHHyd, _groupCnt[c]);
+                        Go(_kSolveNHDevHyd, _groupCnt[c]);
                     }
                 }
 
@@ -414,14 +425,14 @@ namespace SurgicalSim.Physics
             {
                 _cs.SetInt("_GroupOffset", _groupOff[c]);
                 _cs.SetInt("_GroupCount",  _groupCnt[c]);
-                Go(_kSolveNHDev, _groupCnt[c]);
-                Go(_kSolveNHHyd, _groupCnt[c]);
+                Go(_kSolveNHDevHyd, _groupCnt[c]);
             }
         }
 
         void SolveToolContacts()
         {
-            if (_numSurfaceTris <= 0 || _numSurfaceColors <= 0 ||
+            if (_activeToolCapsules <= 0 ||
+                _numSurfaceTris <= 0 || _numSurfaceColors <= 0 ||
                 _bufSurfaceTriIds == null || _bufSurfaceTriColorFlat == null)
                 return;
 
@@ -508,6 +519,12 @@ namespace SurgicalSim.Physics
             Vector3 prevCap2A, Vector3 prevCap2B,
             int numCapsules)
         {
+            _activeToolCapsules = Mathf.Max(0, numCapsules);
+            if (_activeToolCapsules <= 0)
+            {
+                ClearToolCollisionParams();
+                return;
+            }
             _cs.SetVector("_Capsule0A", new Vector4(cap0A.x, cap0A.y, cap0A.z, cap0R));
             _cs.SetVector("_Capsule0B", new Vector4(cap0B.x, cap0B.y, cap0B.z, 0f));
             _cs.SetVector("_Capsule1A", new Vector4(cap1A.x, cap1A.y, cap1A.z, cap1R));
@@ -520,8 +537,36 @@ namespace SurgicalSim.Physics
             _cs.SetVector("_PrevCapsule1B", new Vector4(prevCap1B.x, prevCap1B.y, prevCap1B.z, 0f));
             _cs.SetVector("_PrevCapsule2A", new Vector4(prevCap2A.x, prevCap2A.y, prevCap2A.z, cap2R));
             _cs.SetVector("_PrevCapsule2B", new Vector4(prevCap2B.x, prevCap2B.y, prevCap2B.z, 0f));
+
+            Vector3 bboxMin = Vector3.positiveInfinity;
+            Vector3 bboxMax = Vector3.negativeInfinity;
+            IncludeCapsuleBounds(ref bboxMin, ref bboxMax, cap0A, cap0B, prevCap0A, prevCap0B, cap0R);
+            if (_activeToolCapsules >= 2)
+                IncludeCapsuleBounds(ref bboxMin, ref bboxMax, cap1A, cap1B, prevCap1A, prevCap1B, cap1R);
+            if (_activeToolCapsules >= 3)
+                IncludeCapsuleBounds(ref bboxMin, ref bboxMax, cap2A, cap2B, prevCap2A, prevCap2B, cap2R);
+
+            _cs.SetVector("_ToolBBoxMin", new Vector4(bboxMin.x, bboxMin.y, bboxMin.z, 0f));
+            _cs.SetVector("_ToolBBoxMax", new Vector4(bboxMax.x, bboxMax.y, bboxMax.z, _activeToolCapsules));
+        }
+
+        void IncludeCapsuleBounds(
+            ref Vector3 bboxMin, ref Vector3 bboxMax,
+            Vector3 a, Vector3 b, Vector3 prevA, Vector3 prevB, float radius)
+        {
+            float pad = Mathf.Max(0f, radius) + Mathf.Max(0f, ToolContactDistance);
+            Vector3 padVec = Vector3.one * pad;
+            Vector3 localMin = Vector3.Min(Vector3.Min(a, b), Vector3.Min(prevA, prevB)) - padVec;
+            Vector3 localMax = Vector3.Max(Vector3.Max(a, b), Vector3.Max(prevA, prevB)) + padVec;
+            bboxMin = Vector3.Min(bboxMin, localMin);
+            bboxMax = Vector3.Max(bboxMax, localMax);
+        }
+
+        public void ClearToolCollisionParams()
+        {
+            _activeToolCapsules = 0;
             _cs.SetVector("_ToolBBoxMin", Vector4.zero);
-            _cs.SetVector("_ToolBBoxMax", new Vector4(0f, 0f, 0f, numCapsules));
+            _cs.SetVector("_ToolBBoxMax", Vector4.zero);
         }
 
         public void UploadTetActiveBuffer(bool[] ta)
@@ -631,7 +676,7 @@ namespace SurgicalSim.Physics
         void BindAll()
         {
             int[] ks = { _kIntegrate, _kSolveEdges, _kSolveNHDev,
-                         _kSolveNHHyd, _kPostSolve, _kGroundCollision };
+                         _kSolveNHHyd, _kSolveNHDevHyd, _kPostSolve, _kGroundCollision };
             foreach (int k in ks)
             {
                 _cs.SetBuffer(k, "_Positions",     _bufPos);
@@ -649,7 +694,7 @@ namespace SurgicalSim.Physics
             _cs.SetBuffer(_kSolveEdges, "_EdgeActive", _bufEdgeActive);
 
             // NeoHookean buffers — only needed by NH kernels
-            int[] nhKernels = { _kSolveNHDev, _kSolveNHHyd };
+            int[] nhKernels = { _kSolveNHDev, _kSolveNHHyd, _kSolveNHDevHyd };
             foreach (int k in nhKernels)
             {
                 _cs.SetBuffer(k, "_InvRestMatrix",    _bufInvRestMatrix);

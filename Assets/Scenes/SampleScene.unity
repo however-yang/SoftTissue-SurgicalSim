@@ -418,7 +418,8 @@ MonoBehaviour:
   toolContactCompliance: 0.000002
   toolContactIterations: 4
   toolContactCouplingPasses: 3
-  enableCutting: 1
+  enableGrasping: 1
+  enableCutting: 0
   cutRadius: 0.0047
   virtualBladeRadius: 0.0025
   interiorColor: {r: 0.21960784, g: 0.21960784, b: 0.21960784, a: 1}

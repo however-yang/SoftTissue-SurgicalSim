@@ -74,9 +74,21 @@ namespace SurgicalSim
         [Range(1, 4)]
         public int toolContactCouplingPasses = 3;
 
+        [Header("Grasping")]
+        [Tooltip("Enable gripper visual, GPU tool collision, and particle grasping. Disable for performance isolation.")]
+        public bool enableGrasping = true;
+
+        [Header("Performance")]
+        [Tooltip("Limit Unity FixedUpdate catch-up so a slow contact step does not run several physics steps before one rendered frame.")]
+        public bool limitFixedUpdateCatchUp = true;
+
+        [Tooltip("Maximum FixedUpdate calls Unity may catch up before one rendered frame when the soft-body step is slow.")]
+        [Range(1, 5)]
+        public int maxFixedUpdatesPerRenderedFrame = 1;
+
         [Header("切割")]
         [Tooltip("啟用鼠標拖拽切割")]
-        public bool enableCutting = true;
+        public bool enableCutting = false;
 
         [Tooltip("切割影響半徑")]
         [Range(0.003f, 0.05f)]
@@ -233,6 +245,16 @@ namespace SurgicalSim
 
         bool  _physicsReady = false;
         float _avgStepMs    = 0f;
+        float _lastSolveDispatchMs = 0f;
+        float _lastReadbackMs = 0f;
+        float _lastPhysicsTotalMs = 0f;
+        float _lastVisualRefreshMs = 0f;
+        float _lastToolUploadMs = 0f;
+        float _lastGripperStepMs = 0f;
+        float _originalMaximumDeltaTime = 0f;
+        bool _hasOriginalMaximumDeltaTime = false;
+        int _fixedUpdatesThisRenderFrame = 0;
+        int _lastFixedUpdatesPerRenderFrame = 0;
         float _simTime      = 0f;
 
         Vector3[] _initPositions;
@@ -243,6 +265,9 @@ namespace SurgicalSim
         {
             _loader     = GetComponent<TetMeshLoader>();
             _visualizer = GetComponent<TetMeshVisualizer>();
+            _originalMaximumDeltaTime = Time.maximumDeltaTime;
+            _hasOriginalMaximumDeltaTime = true;
+            ApplyFixedUpdateCatchUpLimit();
         }
 
         void Start()
@@ -254,12 +279,31 @@ namespace SurgicalSim
             }
             _loader.OnMeshLoaded += OnMeshLoaded;
             if (createGroundPlane) CreateGroundPlane();
+            ApplyFixedUpdateCatchUpLimit();
         }
 
         void OnDestroy()
         {
             if (_loader != null) _loader.OnMeshLoaded -= OnMeshLoaded;
             _gpuSolver?.Dispose();
+            if (_hasOriginalMaximumDeltaTime)
+                Time.maximumDeltaTime = _originalMaximumDeltaTime;
+        }
+
+        void ApplyFixedUpdateCatchUpLimit()
+        {
+            if (!Application.isPlaying)
+                return;
+
+            if (!limitFixedUpdateCatchUp)
+            {
+                if (_hasOriginalMaximumDeltaTime)
+                    Time.maximumDeltaTime = _originalMaximumDeltaTime;
+                return;
+            }
+
+            int maxSteps = Mathf.Max(1, maxFixedUpdatesPerRenderedFrame);
+            Time.maximumDeltaTime = Mathf.Max(Time.fixedDeltaTime, Time.fixedDeltaTime * maxSteps);
         }
 
         // ── 初始化 ────────────────────────────────────────────
@@ -309,11 +353,23 @@ namespace SurgicalSim
                 _cuttingTool.Init(data, _gpuSolver, _visualizer);
             }
 
-            // 初始化夹爪工具
-            _gripperTool = GetComponent<GripperTool>();
-            if (_gripperTool == null)
-                _gripperTool = gameObject.AddComponent<GripperTool>();
-            _gripperTool.Init(data, _gpuSolver, _visualizer);
+            // Gripper tool is optional so pure liver performance can be profiled.
+            if (enableGrasping)
+            {
+                _gripperTool = GetComponent<GripperTool>();
+                if (_gripperTool == null)
+                    _gripperTool = gameObject.AddComponent<GripperTool>();
+                _gripperTool.enabled = true;
+                _gripperTool.Init(data, _gpuSolver, _visualizer);
+            }
+            else
+            {
+                _gripperTool = null;
+                var existingGripper = GetComponent<GripperTool>();
+                if (existingGripper != null)
+                    existingGripper.enabled = false;
+                _gpuSolver.ClearToolCollisionParams();
+            }
 
             // 設置雙面渲染材質（切面內部顏色）
             SetupTwoSidedMaterial();
@@ -323,7 +379,8 @@ namespace SurgicalSim
 
             Debug.Log($"[SoftBody] GPU 求解器啟動 | 重力: {gravityY} m/s² | " +
                       $"子步: {numSubSteps} | 地面 Y: {groundY}" +
-                      $"{(enableCutting ? " | 切割: ON" : "")}");
+                      $"{(enableCutting ? " | 切割: ON" : "")}" +
+                      $"{(enableGrasping ? " | 夹取: ON" : " | 夹取: OFF")}");
         }
 
         // ── 物理更新（FixedUpdate）────────────────────────────
@@ -333,6 +390,8 @@ namespace SurgicalSim
         void FixedUpdate()
         {
             if (!_physicsReady || _data == null || pausePhysics || _gpuSolver == null) return;
+            _fixedUpdatesThisRenderFrame++;
+            ApplyFixedUpdateCatchUpLimit();
 
             // ★ 切割: 在物理步之前上传脏 buffer 到 GPU
             if (_cuttingTool != null)
@@ -365,9 +424,17 @@ namespace SurgicalSim
             _gpuSolver.ToolContactCouplingPasses = toolContactCouplingPasses;
 
             // ★ 夹爪碰撞: 在 Step 之前上传平面参数到 GPU
-            if (_gripperTool != null)
+            _lastToolUploadMs = 0f;
+            _lastGripperStepMs = 0f;
+            if (enableGrasping && _gripperTool != null)
             {
-                try { _gripperTool.UploadToolCollisionToGPU(); }
+                try
+                {
+                    var toolSw = System.Diagnostics.Stopwatch.StartNew();
+                    _gripperTool.UploadToolCollisionToGPU();
+                    toolSw.Stop();
+                    _lastToolUploadMs = (float)toolSw.Elapsed.TotalMilliseconds;
+                }
                 catch (System.Exception ex)
                 { Debug.LogError($"[SoftBody] UploadToolCollision 异常: {ex.Message}"); }
             }
@@ -375,8 +442,15 @@ namespace SurgicalSim
             try
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
+                var partSw = System.Diagnostics.Stopwatch.StartNew();
                 _gpuSolver.Step(Time.fixedDeltaTime);
+                partSw.Stop();
+                _lastSolveDispatchMs = (float)partSw.Elapsed.TotalMilliseconds;
+
+                partSw.Restart();
                 _gpuSolver.ReadbackPositions(_data);
+                partSw.Stop();
+                _lastReadbackMs = (float)partSw.Elapsed.TotalMilliseconds;
                 sw.Stop();
 
                 // 計算位置變化量（用非固定粒子）
@@ -385,8 +459,8 @@ namespace SurgicalSim
                 _maxPosDelta = Mathf.Max(_maxPosDelta * 0.99f, delta);
 
                 float ms   = (float)sw.Elapsed.TotalMilliseconds;
+                _lastPhysicsTotalMs = ms;
                 _avgStepMs = _avgStepMs * 0.95f + ms * 0.05f;
-
                 // 前5帧打印详细诊断
                 if (_physicsFrame < 5)
                 {
@@ -402,9 +476,15 @@ namespace SurgicalSim
             }
 
             // ★ 夹爪夹取逻辑：在 Readback 之后执行（仅处理粒子捕获/释放）
-            if (_gripperTool != null)
+            if (enableGrasping && _gripperTool != null)
             {
-                try { _gripperTool.PhysicsStep(); }
+                try
+                {
+                    var gripperSw = System.Diagnostics.Stopwatch.StartNew();
+                    _gripperTool.PhysicsStep();
+                    gripperSw.Stop();
+                    _lastGripperStepMs = (float)gripperSw.Elapsed.TotalMilliseconds;
+                }
                 catch (System.Exception ex)
                 { Debug.LogError($"[SoftBody] GripperTool PhysicsStep 异常: {ex.Message}"); }
             }
@@ -412,12 +492,39 @@ namespace SurgicalSim
             _simTime += Time.fixedDeltaTime;
             _physicsFrame++;
 
-            _visualizer.Refresh();
+            var visualSw = System.Diagnostics.Stopwatch.StartNew();
+            if (!(_sofaVisualRenderer != null &&
+                  _sofaVisualRenderer.IsInitialized &&
+                  hideTetSurfaceWhenSofaVisualActive))
+            {
+                _visualizer.Refresh();
+            }
             _sofaVisualRenderer?.Refresh();
+            visualSw.Stop();
+            _lastVisualRefreshMs = (float)visualSw.Elapsed.TotalMilliseconds;
+
+            if (_physicsFrame % 60 == 0)
+            {
+                int internalDispatchesForLog = _gpuSolver != null ? _gpuSolver.EstimatedInternalDispatchesPerFrame : 0;
+                int toolDispatchesForLog = _gpuSolver != null ? _gpuSolver.EstimatedToolContactDispatchesPerFrame : 0;
+                float renderFps = _fps;
+                Debug.Log($"[Perf] renderFPS={renderFps:F1} toolUpload={_lastToolUploadMs:F3}ms " +
+                          $"solveDispatch={_lastSolveDispatchMs:F2}ms readback={_lastReadbackMs:F2}ms " +
+                          $"physicsTotal={_lastPhysicsTotalMs:F2}ms visualRefresh={_lastVisualRefreshMs:F2}ms " +
+                          $"gripperStep={_lastGripperStepMs:F3}ms " +
+                          $"internalDispatches={internalDispatchesForLog} toolDispatches={toolDispatchesForLog} " +
+                          $"fixedPerRender={_lastFixedUpdatesPerRenderFrame} maxDt={Time.maximumDeltaTime:F3}");
+            }
 
         }
 
         // ── 鍵盤控制 ─────────────────────────────────────────
+        void LateUpdate()
+        {
+            _lastFixedUpdatesPerRenderFrame = _fixedUpdatesThisRenderFrame;
+            _fixedUpdatesThisRenderFrame = 0;
+        }
+
         void Update()
         {
             if (Input.GetKeyDown(KeyCode.P))
@@ -1034,7 +1141,7 @@ namespace SurgicalSim
                 _cuttingTool.Init(_data, _gpuSolver, _visualizer);  // V3 reinit
 
             // 重新初始化夹爪工具
-            if (_gripperTool != null)
+            if (enableGrasping && _gripperTool != null)
                 _gripperTool.Init(_data, _gpuSolver, _visualizer);
 
             // 恢复原始表面三角形
@@ -1084,7 +1191,6 @@ namespace SurgicalSim
 
             // FPS 颜色标记
             string fpsColor = _fps >= 30 ? "#00FF00" : (_fps >= 15 ? "#FFFF00" : "#FF0000");
-
             string info =
                 $"<color={fpsColor}>FPS: {_fps:F0}</color>\n" +
                 $"XPBD GPU | Tet Subdivision Cut (PG2025)\n" +
@@ -1098,6 +1204,7 @@ namespace SurgicalSim
                 "UIOJKL移动 Space切割 方向键旋转 P暂停";
 
             // 使用 richText
+            info += $"\nFixed/Frame: {_lastFixedUpdatesPerRenderFrame} | MaxDt: {Time.maximumDeltaTime:F3}";
             style.richText = true;
 
             GUI.Box(new Rect(10, 10, 390, 240), info, style);
