@@ -418,6 +418,8 @@ MonoBehaviour:
   toolContactCompliance: 0.000002
   toolContactIterations: 4
   toolContactCouplingPasses: 3
+  useToolContactCandidateCulling: 1
+  toolContactCandidatePadding: 0.06
   enableGrasping: 1
   enableCutting: 0
   cutRadius: 0.0047

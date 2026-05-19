@@ -32,7 +32,7 @@ namespace SurgicalSim.Physics
         ComputeBuffer _bufTetIds, _bufRestVol, _bufTetActive;
         ComputeBuffer _bufEdgeIds, _bufRestLen, _bufEdgeActive;
         ComputeBuffer _bufColorFlat, _bufEdgeColorFlat;
-        ComputeBuffer _bufSurfaceTriIds, _bufSurfaceTriColorFlat;
+        ComputeBuffer _bufSurfaceTriIds, _bufSurfaceTriColorFlat, _bufSurfaceTriCandidateFlat;
         // NeoHookean 专用
         ComputeBuffer _bufInvRestMatrix;    // float4[numT*3]
         ComputeBuffer _bufAlphaDeviatoric;  // float[numT]
@@ -40,6 +40,9 @@ namespace SurgicalSim.Physics
 
         int[] _groupOff, _groupCnt; int _numColors;
         int[] _edgeGroupOff, _edgeGroupCnt; int _numEdgeColors;
+        int[] _surfaceTriColorByTri;
+        int[] _toolCandidateSelected, _toolCandidateFlat;
+        int[] _toolCandidateGroupOff, _toolCandidateGroupCnt, _toolCandidateGroupCursor;
 
         int _numP, _numT, _numE, _numSurfaceTris;
         const int TH = 64;
@@ -48,19 +51,32 @@ namespace SurgicalSim.Physics
         List<int>[] _edgeToTets;
         int[] _surfaceGroupOff, _surfaceGroupCnt; int _numSurfaceColors;
         int _activeToolCapsules;
+        int _activeToolSurfaceCandidateTris;
+        int _activeToolSurfaceCandidateColors;
+        bool _toolCandidatesValid;
+        readonly Vector3[] _toolCapsuleBboxMin = new Vector3[3];
+        readonly Vector3[] _toolCapsuleBboxMax = new Vector3[3];
 
         public float ToolContactDistance = 0.01f;
         public float ToolContactCompliance = 1e-7f;
         public int ToolContactIterations = 2;
         public int ToolContactCouplingPasses = 2;
+        public bool UseToolContactCandidateCulling = true;
+        public float ToolContactCandidatePadding = 0.06f;
         public int ActiveToolCapsules => _activeToolCapsules;
+        public int NumSurfaceTris => _numSurfaceTris;
+        public int ActiveToolSurfaceCandidateTris =>
+            _activeToolCapsules > 0
+                ? (UseToolContactCandidateCulling ? _activeToolSurfaceCandidateTris : _numSurfaceTris)
+                : 0;
         public int InternalDispatchesPerPass => _numEdgeColors + _numColors;
         public int EstimatedInternalDispatchesPerFrame =>
             NumSubSteps * (1 + Mathf.Max(1, ToolContactCouplingPasses)) * InternalDispatchesPerPass;
         public int EstimatedToolContactDispatchesPerFrame =>
             _activeToolCapsules > 0
                 ? NumSubSteps * (1 + Mathf.Max(1, ToolContactCouplingPasses)) *
-                  Mathf.Max(1, ToolContactIterations) * _numSurfaceColors
+                  Mathf.Max(1, ToolContactIterations) *
+                  (UseToolContactCandidateCulling ? _activeToolSurfaceCandidateColors : _numSurfaceColors)
                 : 0;
 
         [System.Runtime.InteropServices.StructLayout(
@@ -253,7 +269,8 @@ namespace SurgicalSim.Physics
                 out _edgeGroupOff, out _edgeGroupCnt, out _numEdgeColors);
             BuildSurfaceTriColorGroups(data.SurfaceTriIds, _numSurfaceTris, _numP,
                 out int[] surfaceTriColorFlat,
-                out _surfaceGroupOff, out _surfaceGroupCnt, out _numSurfaceColors);
+                out _surfaceGroupOff, out _surfaceGroupCnt, out _surfaceTriColorByTri,
+                out _numSurfaceColors);
 
             // ── 上传 GPU Buffer ──────────────────────────────
             _bufPos      = MkV4(ToV4(curPos, _numP));
@@ -284,6 +301,12 @@ namespace SurgicalSim.Physics
             {
                 _bufSurfaceTriIds = MkU3(ToU3(data.SurfaceTriIds, _numSurfaceTris));
                 _bufSurfaceTriColorFlat = MkI(surfaceTriColorFlat);
+                _bufSurfaceTriCandidateFlat = new ComputeBuffer(Mathf.Max(1, _numSurfaceTris), 4);
+                _toolCandidateSelected = new int[_numSurfaceTris];
+                _toolCandidateFlat = new int[_numSurfaceTris];
+                _toolCandidateGroupOff = new int[_numSurfaceColors];
+                _toolCandidateGroupCnt = new int[_numSurfaceColors];
+                _toolCandidateGroupCursor = new int[_numSurfaceColors];
             }
 
             _readBuf = new Vector4[_numP];
@@ -436,14 +459,36 @@ namespace SurgicalSim.Physics
                 _bufSurfaceTriIds == null || _bufSurfaceTriColorFlat == null)
                 return;
 
+            int[] groupOff = _surfaceGroupOff;
+            int[] groupCnt = _surfaceGroupCnt;
+            int numGroups = _numSurfaceColors;
+
+            if (UseToolContactCandidateCulling)
+            {
+                if (!_toolCandidatesValid || _activeToolSurfaceCandidateTris <= 0 ||
+                    _bufSurfaceTriCandidateFlat == null)
+                    return;
+
+                _cs.SetBuffer(_kSolveSurfaceToolContacts, "_SurfaceTriColorGroupFlat", _bufSurfaceTriCandidateFlat);
+                groupOff = _toolCandidateGroupOff;
+                groupCnt = _toolCandidateGroupCnt;
+            }
+            else
+            {
+                _cs.SetBuffer(_kSolveSurfaceToolContacts, "_SurfaceTriColorGroupFlat", _bufSurfaceTriColorFlat);
+            }
+
             int iterations = Mathf.Max(1, ToolContactIterations);
             for (int iter = 0; iter < iterations; iter++)
             {
-                for (int c = 0; c < _numSurfaceColors; c++)
+                for (int c = 0; c < numGroups; c++)
                 {
-                    _cs.SetInt("_SurfaceGroupOffset", _surfaceGroupOff[c]);
-                    _cs.SetInt("_SurfaceGroupCount",  _surfaceGroupCnt[c]);
-                    Go(_kSolveSurfaceToolContacts, _surfaceGroupCnt[c]);
+                    int count = groupCnt[c];
+                    if (count <= 0) continue;
+
+                    _cs.SetInt("_SurfaceGroupOffset", groupOff[c]);
+                    _cs.SetInt("_SurfaceGroupCount",  count);
+                    Go(_kSolveSurfaceToolContacts, count);
                 }
             }
         }
@@ -540,14 +585,29 @@ namespace SurgicalSim.Physics
 
             Vector3 bboxMin = Vector3.positiveInfinity;
             Vector3 bboxMax = Vector3.negativeInfinity;
+            SetCapsuleBounds(0, cap0A, cap0B, prevCap0A, prevCap0B, cap0R);
             IncludeCapsuleBounds(ref bboxMin, ref bboxMax, cap0A, cap0B, prevCap0A, prevCap0B, cap0R);
             if (_activeToolCapsules >= 2)
+            {
+                SetCapsuleBounds(1, cap1A, cap1B, prevCap1A, prevCap1B, cap1R);
                 IncludeCapsuleBounds(ref bboxMin, ref bboxMax, cap1A, cap1B, prevCap1A, prevCap1B, cap1R);
+            }
             if (_activeToolCapsules >= 3)
+            {
+                SetCapsuleBounds(2, cap2A, cap2B, prevCap2A, prevCap2B, cap2R);
                 IncludeCapsuleBounds(ref bboxMin, ref bboxMax, cap2A, cap2B, prevCap2A, prevCap2B, cap2R);
+            }
 
             _cs.SetVector("_ToolBBoxMin", new Vector4(bboxMin.x, bboxMin.y, bboxMin.z, 0f));
             _cs.SetVector("_ToolBBoxMax", new Vector4(bboxMax.x, bboxMax.y, bboxMax.z, _activeToolCapsules));
+        }
+
+        void SetCapsuleBounds(int index, Vector3 a, Vector3 b, Vector3 prevA, Vector3 prevB, float radius)
+        {
+            float pad = Mathf.Max(0f, radius) + Mathf.Max(0f, ToolContactDistance);
+            Vector3 padVec = Vector3.one * pad;
+            _toolCapsuleBboxMin[index] = Vector3.Min(Vector3.Min(a, b), Vector3.Min(prevA, prevB)) - padVec;
+            _toolCapsuleBboxMax[index] = Vector3.Max(Vector3.Max(a, b), Vector3.Max(prevA, prevB)) + padVec;
         }
 
         void IncludeCapsuleBounds(
@@ -565,8 +625,116 @@ namespace SurgicalSim.Physics
         public void ClearToolCollisionParams()
         {
             _activeToolCapsules = 0;
+            ClearToolContactCandidates();
             _cs.SetVector("_ToolBBoxMin", Vector4.zero);
             _cs.SetVector("_ToolBBoxMax", Vector4.zero);
+        }
+
+        public void ClearToolContactCandidates()
+        {
+            _activeToolSurfaceCandidateTris = 0;
+            _activeToolSurfaceCandidateColors = 0;
+            _toolCandidatesValid = false;
+            if (_toolCandidateGroupCnt != null)
+                Array.Clear(_toolCandidateGroupCnt, 0, _toolCandidateGroupCnt.Length);
+        }
+
+        public void UpdateToolContactCandidates(Core.TetMeshData data)
+        {
+            ClearToolContactCandidates();
+
+            if (!UseToolContactCandidateCulling ||
+                _activeToolCapsules <= 0 ||
+                data == null ||
+                data.SurfaceTriIds == null ||
+                data.Positions == null ||
+                _surfaceTriColorByTri == null ||
+                _bufSurfaceTriCandidateFlat == null ||
+                _toolCandidateSelected == null ||
+                _toolCandidateFlat == null ||
+                _toolCandidateGroupCnt == null ||
+                _toolCandidateGroupOff == null ||
+                _toolCandidateGroupCursor == null)
+                return;
+
+            Vector3 extraPad = Vector3.one * Mathf.Max(0f, ToolContactCandidatePadding);
+            int total = 0;
+            int maxTris = Mathf.Min(_numSurfaceTris, data.NumSurfaceTris);
+            int[] triIds = data.SurfaceTriIds;
+            Vector3[] positions = data.Positions;
+
+            for (int tri = 0; tri < maxTris; tri++)
+            {
+                int baseIdx = tri * 3;
+                int i0 = triIds[baseIdx + 0];
+                int i1 = triIds[baseIdx + 1];
+                int i2 = triIds[baseIdx + 2];
+                if (i0 < 0 || i0 >= positions.Length ||
+                    i1 < 0 || i1 >= positions.Length ||
+                    i2 < 0 || i2 >= positions.Length)
+                    continue;
+
+                Vector3 p0 = positions[i0];
+                Vector3 p1 = positions[i1];
+                Vector3 p2 = positions[i2];
+                Vector3 triMin = Vector3.Min(p0, Vector3.Min(p1, p2));
+                Vector3 triMax = Vector3.Max(p0, Vector3.Max(p1, p2));
+
+                if (!OverlapsAnyActiveToolCapsuleBounds(triMin, triMax, extraPad))
+                    continue;
+
+                int color = _surfaceTriColorByTri[tri];
+                if (color < 0 || color >= _toolCandidateGroupCnt.Length)
+                    continue;
+
+                _toolCandidateSelected[total++] = tri;
+                _toolCandidateGroupCnt[color]++;
+            }
+
+            if (total <= 0)
+            {
+                _toolCandidatesValid = true;
+                return;
+            }
+
+            int offset = 0;
+            int activeColors = 0;
+            for (int c = 0; c < _numSurfaceColors; c++)
+            {
+                _toolCandidateGroupOff[c] = offset;
+                _toolCandidateGroupCursor[c] = offset;
+                int count = _toolCandidateGroupCnt[c];
+                if (count > 0)
+                    activeColors++;
+                offset += count;
+            }
+
+            for (int i = 0; i < total; i++)
+            {
+                int tri = _toolCandidateSelected[i];
+                int color = _surfaceTriColorByTri[tri];
+                _toolCandidateFlat[_toolCandidateGroupCursor[color]++] = tri;
+            }
+
+            _bufSurfaceTriCandidateFlat.SetData(_toolCandidateFlat, 0, 0, total);
+            _activeToolSurfaceCandidateTris = total;
+            _activeToolSurfaceCandidateColors = activeColors;
+            _toolCandidatesValid = true;
+        }
+
+        bool OverlapsAnyActiveToolCapsuleBounds(Vector3 triMin, Vector3 triMax, Vector3 extraPad)
+        {
+            for (int i = 0; i < _activeToolCapsules && i < 3; i++)
+            {
+                Vector3 min = _toolCapsuleBboxMin[i] - extraPad;
+                Vector3 max = _toolCapsuleBboxMax[i] + extraPad;
+                if (!(triMax.x < min.x || triMin.x > max.x ||
+                      triMax.y < min.y || triMin.y > max.y ||
+                      triMax.z < min.z || triMin.z > max.z))
+                    return true;
+            }
+
+            return false;
         }
 
         public void UploadTetActiveBuffer(bool[] ta)
@@ -611,6 +779,7 @@ namespace SurgicalSim.Physics
             _bufEdgeActive?.Release();
             _bufColorFlat?.Release(); _bufEdgeColorFlat?.Release();
             _bufSurfaceTriIds?.Release(); _bufSurfaceTriColorFlat?.Release();
+            _bufSurfaceTriCandidateFlat?.Release();
             _bufInvRestMatrix?.Release();
             _bufAlphaDeviatoric?.Release(); _bufAlphaHydrostatic?.Release();
         }
@@ -820,13 +989,14 @@ namespace SurgicalSim.Physics
 
         // ── Buffer helpers ──────────────────────────────────
         void BuildSurfaceTriColorGroups(int[] triIds, int numTris, int numParticles,
-            out int[] flat, out int[] offsets, out int[] counts, out int numColors)
+            out int[] flat, out int[] offsets, out int[] counts, out int[] colorByTri, out int numColors)
         {
             if (triIds == null || numTris <= 0)
             {
                 flat = Array.Empty<int>();
                 offsets = Array.Empty<int>();
                 counts = Array.Empty<int>();
+                colorByTri = Array.Empty<int>();
                 numColors = 0;
                 return;
             }
@@ -877,6 +1047,8 @@ namespace SurgicalSim.Physics
                 groups[i].CopyTo(flat, off);
                 off += groups[i].Count;
             }
+
+            colorByTri = color;
         }
 
         ComputeBuffer MkV4(Vector4[] d) { var b=new ComputeBuffer(d.Length,16); b.SetData(d); return b; }

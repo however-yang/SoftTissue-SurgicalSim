@@ -73,6 +73,10 @@ namespace SurgicalSim
         public int toolContactIterations = 4;
         [Range(1, 4)]
         public int toolContactCouplingPasses = 3;
+        [Tooltip("CPU broadphase that limits GPU surface contact solving to triangles near the gripper capsules.")]
+        public bool useToolContactCandidateCulling = true;
+        [Range(0f, 0.25f)]
+        public float toolContactCandidatePadding = 0.06f;
 
         [Header("Grasping")]
         [Tooltip("Enable gripper visual, GPU tool collision, and particle grasping. Disable for performance isolation.")]
@@ -422,6 +426,8 @@ namespace SurgicalSim
             _gpuSolver.ToolContactCompliance = toolContactCompliance;
             _gpuSolver.ToolContactIterations = toolContactIterations;
             _gpuSolver.ToolContactCouplingPasses = toolContactCouplingPasses;
+            _gpuSolver.UseToolContactCandidateCulling = useToolContactCandidateCulling;
+            _gpuSolver.ToolContactCandidatePadding = toolContactCandidatePadding;
 
             // ★ 夹爪碰撞: 在 Step 之前上传平面参数到 GPU
             _lastToolUploadMs = 0f;
@@ -432,11 +438,16 @@ namespace SurgicalSim
                 {
                     var toolSw = System.Diagnostics.Stopwatch.StartNew();
                     _gripperTool.UploadToolCollisionToGPU();
+                    _gpuSolver.UpdateToolContactCandidates(_data);
                     toolSw.Stop();
                     _lastToolUploadMs = (float)toolSw.Elapsed.TotalMilliseconds;
                 }
                 catch (System.Exception ex)
                 { Debug.LogError($"[SoftBody] UploadToolCollision 异常: {ex.Message}"); }
+            }
+            else
+            {
+                _gpuSolver.ClearToolContactCandidates();
             }
 
             try
@@ -507,12 +518,15 @@ namespace SurgicalSim
             {
                 int internalDispatchesForLog = _gpuSolver != null ? _gpuSolver.EstimatedInternalDispatchesPerFrame : 0;
                 int toolDispatchesForLog = _gpuSolver != null ? _gpuSolver.EstimatedToolContactDispatchesPerFrame : 0;
+                int contactTrisForLog = _gpuSolver != null ? _gpuSolver.ActiveToolSurfaceCandidateTris : 0;
+                int totalSurfaceTrisForLog = _gpuSolver != null ? _gpuSolver.NumSurfaceTris : 0;
                 float renderFps = _fps;
                 Debug.Log($"[Perf] renderFPS={renderFps:F1} toolUpload={_lastToolUploadMs:F3}ms " +
                           $"solveDispatch={_lastSolveDispatchMs:F2}ms readback={_lastReadbackMs:F2}ms " +
                           $"physicsTotal={_lastPhysicsTotalMs:F2}ms visualRefresh={_lastVisualRefreshMs:F2}ms " +
                           $"gripperStep={_lastGripperStepMs:F3}ms " +
                           $"internalDispatches={internalDispatchesForLog} toolDispatches={toolDispatchesForLog} " +
+                          $"contactTris={contactTrisForLog}/{totalSurfaceTrisForLog} " +
                           $"fixedPerRender={_lastFixedUpdatesPerRenderFrame} maxDt={Time.maximumDeltaTime:F3}");
             }
 
@@ -1205,6 +1219,8 @@ namespace SurgicalSim
 
             // 使用 richText
             info += $"\nFixed/Frame: {_lastFixedUpdatesPerRenderFrame} | MaxDt: {Time.maximumDeltaTime:F3}";
+            if (_gpuSolver != null && _gpuSolver.ActiveToolCapsules > 0)
+                info += $"\nContact Tris: {_gpuSolver.ActiveToolSurfaceCandidateTris}/{_gpuSolver.NumSurfaceTris}";
             style.richText = true;
 
             GUI.Box(new Rect(10, 10, 390, 240), info, style);
