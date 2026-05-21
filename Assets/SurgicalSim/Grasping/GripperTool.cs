@@ -52,7 +52,7 @@ namespace SurgicalSim.Grasping
 
         [Header("开合")]
         [Tooltip("最大张开角度 (度)")]
-        public float maxOpenAngle = 25f;
+        public float maxOpenAngle = 50f;
         [Tooltip("开合角速度 (度/秒)")]
         public float openCloseSpeed = 60f;
 
@@ -187,16 +187,20 @@ namespace SurgicalSim.Grasping
             if (Input.GetKey(KeyCode.Keypad1)) _toolRotY -= rotateSpeed * Time.deltaTime;
             if (Input.GetKey(KeyCode.Keypad3)) _toolRotY += rotateSpeed * Time.deltaTime;
 
-            // ── 开合（Numpad 0）──────────────────────────
-            if (Input.GetKeyDown(KeyCode.Keypad0))
+            // Z/X continuous jaw control: hold to move, release to stop.
+            bool closeHeld = Input.GetKey(KeyCode.Z);
+            bool openHeld = Input.GetKey(KeyCode.X);
+            float jawStep = openCloseSpeed * Time.deltaTime;
+            if (closeHeld && !openHeld)
             {
-                _wantClose = !_wantClose;
-                Debug.Log($"[GripperTool] {(_wantClose ? "闭合" : "张开")}");
+                _wantClose = true;
+                _currentAngle = Mathf.MoveTowards(_currentAngle, 0f, jawStep);
             }
-
-            float targetAngle = _wantClose ? 0f : maxOpenAngle;
-            _currentAngle = Mathf.MoveTowards(_currentAngle, targetAngle,
-                                               openCloseSpeed * Time.deltaTime);
+            else if (openHeld && !closeHeld)
+            {
+                _wantClose = false;
+                _currentAngle = Mathf.MoveTowards(_currentAngle, maxOpenAngle, jawStep);
+            }
 
             UpdateVisual();
         }
@@ -693,7 +697,7 @@ namespace SurgicalSim.Grasping
                 $"角度: {_currentAngle:F1}°\n" +
                 $"粒子: {_graspedParticles.Count}\n" +
                 $"R={capsuleRadius:F4}\n" +
-                $"FGHVBN移动 1/3旋转 0开合";
+                $"FGHVBN移动 1/3旋转 Z/X开合";
             GUI.Box(new Rect(10, 360, 240, 100), info, style);
         }
     }
