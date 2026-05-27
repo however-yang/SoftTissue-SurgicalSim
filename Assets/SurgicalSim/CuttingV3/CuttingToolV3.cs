@@ -1,494 +1,371 @@
+// CuttingToolV3.cs — Phase 1: 扫掠面连续切割控制器
+//
+// 工作流:
+//   1. SurgicalTool 提供刀刃线段端点 (BladeA, BladeB)
+//   2. 碰触检测: 刀刃附近是否有活跃 tet
+//   3. 将刀刃端点转换到 mesh local space
+//   4. 传递扫掠四边形 (A0,B0,A1,B1) 给 TetSubdivisionCutter
+//   5. FixedUpdate 中 flush 到 GPU
+
 using System.Collections.Generic;
 using UnityEngine;
 using SurgicalSim.Core;
 using SurgicalSim.Cutting;
 using SurgicalSim.Physics;
+using SurgicalSim.Rendering;
 
 namespace SurgicalSim.CuttingV3
 {
     public class CuttingToolV3 : MonoBehaviour
     {
-        [Header("Cutting")]
+        [Header("切割参数")]
+        [Tooltip("扫掠面多大范围内的tet会被检测")]
         public float cutRadius = 0.05f;
 
-        [Header("Contact")]
+        [Header("碰触检测")]
+        [Tooltip("刀刃附近多大范围算碰到肝脏")]
         public float contactRadius = 0.03f;
 
-        [Header("Continuous Stroke")]
-        [Tooltip("Reference length used to derive the path sampler minimum-move "
-               + "threshold. Smaller values keep more samples (smoother but more "
-               + "cut work); larger values drop low-velocity jitter. Default 0.012 "
-               + "is fine for ~0.4 m organ models.")]
-        public float maxCutSegmentLength = 0.012f;
-
-        [Range(1, 8)]
-        [Tooltip("Catmull-Rom subdivisions per ribbon segment emitted by the "
-               + "path sampler. 1-2 keeps the cut responsive; raise only if "
-               + "the tool sampling rate is visibly too coarse.")]
-        public int maxCutSubsteps = 2;
-
-        [Tooltip("Force a solver/surface rebuild when the blade leaves the mesh.")]
-        public bool forceFlushOnExit = true;
-
-        [Tooltip("Prevent tets created by this stroke from being cut again before the blade exits. This keeps one continuous stroke from repeatedly tessellating the same cut sheet.")]
-        public bool protectNewTetsForStroke = true;
-
-        [Header("Input")]
+        [Header("输入")]
         public bool useSurgicalTool = true;
 
-        [Header("Performance")]
-        [Tooltip("Rebuild the visible surface while the blade is still inside tissue.")]
-        public bool rebuildSurfaceDuringStroke = true;
-
+        [Header("性能")]
         [Range(1, 10)]
-        public int surfaceUpdateInterval = 1;
+        public int flushInterval = 2;
 
-        [Tooltip("Allow expensive GPU/surface rebuilds while the blade is still inside tissue.")]
-        public bool flushDuringStroke = true;
-
-        [Range(1, 30)]
-        public int flushInterval = 3;
-
-        [Header("Cut Surface")]
-        [Tooltip("Render zero-width cut faces from explicit split polygons instead of raw tet boundary fragments.")]
-        public bool renderExplicitCutSurface = true;
-
-        [Tooltip("Rebuild cut-surface rendering from current active tets so old cut patches cannot be dragged across separated components.")]
-        public bool rebuildCutSurfaceFromActiveTopology = true;
-
-        [Tooltip("Optional visual guard for long stale/sliver cut triangles. 0 disables filtering. Active-topology cut-surface rebuilds do not need this guard.")]
-        public float maxRenderedCutSurfaceEdge = 0f;
-
-        [Header("Debug")]
+        [Header("调试")]
         public bool showDebugRay = true;
 
+        // ── 私有 ─────────────────────────────────────────────
         TetSubdivisionCutter _cutter;
-        TetMeshData _data;
-        TetMeshVisualizer _visualizer;
-        XPBDSolverGPU _solver;
-        SurgicalTool _surgicalTool;
-        CutSurfaceRenderer _cutSurfaceRenderer;
-        Camera _cam;
+        TetMeshData          _data;
+        TetMeshVisualizer    _visualizer;
+        XPBDSolverGPU        _solver;
+        SurgicalTool         _surgicalTool;
+        SofaUnityVisualLiverRenderer _sofaVisualRenderer;
+        Camera               _cam;
 
-        bool _isCutting;
-        bool _wasInsideMesh;
-        int _framesSinceFlush;
-        int _framesSinceSurfaceUpdate;
-        bool _forceFlushRequested;
-        int _surfaceSyncedNewVerts;
-        int _surfaceSyncedNewTets;
-        int _surfaceSyncedCutTets;
-        float _lastSurfaceUpdateMs;
-        float _lastGpuFlushMs;
+        bool    _isCutting;
+        bool    _wasInsideMesh;
+        int     _framesSinceFlush;
 
-        BladePathSampler _sampler;
-        readonly List<TetSubdivisionCutter.CutSurfacePatch> _cutPatchDrain =
-            new List<TetSubdivisionCutter.CutSurfacePatch>(256);
-        readonly List<int> _patchParticleIds = new List<int>(4);
-        readonly List<int> _renderSurfaceTris = new List<int>(8192);
-        readonly List<int> _renderCutTris = new List<int>(4096);
+        // 上帧刀刃端点 (local space)
+        Vector3 _prevBladeA_local;
+        Vector3 _prevBladeB_local;
+        bool    _hasPrevBlade;
+
+        // 鼠标模式
+        Vector3 _prevHitPoint;
+        bool    _hasHit;
 
         LineRenderer _debugLine;
+        readonly List<int> _renderOriginalSurfaceTris = new List<int>(8192);
+        readonly List<int> _renderCutTris = new List<int>(4096);
+        readonly HashSet<long> _renderOriginalSurfaceKeys = new HashSet<long>();
 
-        public void Init(TetMeshData data, XPBDSolverGPU solver, TetMeshVisualizer visualizer)
+        // ══════════════════════════════════════════════════════
+        public void Init(TetMeshData data, XPBDSolverGPU solver,
+                         TetMeshVisualizer visualizer)
         {
-            _data = data;
-            _solver = solver;
+            _data       = data;
+            _solver     = solver;
             _visualizer = visualizer;
-            _cam = Camera.main;
+            _cam        = Camera.main;
 
             _cutter = new TetSubdivisionCutter();
             _cutter.Init(data, solver);
-            _cutter.ProtectStrokeBornTets = protectNewTetsForStroke;
-
-            // The sampler dedup threshold is derived from maxCutSegmentLength
-            // so it still tracks the inspector value, but clamped into a safe
-            // band: a too-large minMove starves the spline of samples and
-            // gives a coarser cut; too small wastes work on jitter that the
-            // surface reconstructor would never resolve anyway.
-            float minMove = Mathf.Clamp(maxCutSegmentLength * 0.15f, 0.0005f, 0.005f);
-            _sampler = new BladePathSampler(
-                substeps: Mathf.Clamp(maxCutSubsteps, 1, 8),
-                minMove: minMove);
-
             _framesSinceFlush = 0;
-            _framesSinceSurfaceUpdate = 0;
-            _forceFlushRequested = false;
-            _wasInsideMesh = false;
-            _isCutting = false;
-            MarkSurfaceSynced();
+            _wasInsideMesh    = false;
+            _hasPrevBlade     = false;
 
             if (useSurgicalTool) EnsureSurgicalTool();
-            if (renderExplicitCutSurface && !rebuildCutSurfaceFromActiveTopology)
-                EnsureCutSurfaceRenderer(clearExisting: true);
-            else
-                ClearLegacyCutSurfaceRenderer();
-            if (showDebugRay) SetupDebugLine();
+            if (showDebugRay)    SetupDebugLine();
 
             Debug.Log($"[CuttingToolV3] Init P:{data.NumParticles} T:{data.NumTets}");
         }
 
+        // ══════════════════════════════════════════════════════
         void Update()
         {
             if (_data == null) return;
             if (useSurgicalTool) AutoCutStep();
-            else MouseCutStep();
-
-            if (renderExplicitCutSurface && !rebuildCutSurfaceFromActiveTopology && _cutSurfaceRenderer != null)
-                _cutSurfaceRenderer.UpdatePositions(_data);
+            else                 MouseCutStep();
         }
 
+        // ══════════════════════════════════════════════════════
+        // 自动碰触切割 — 扫掠面版
+        // ══════════════════════════════════════════════════════
         void AutoCutStep()
         {
-            if (_surgicalTool == null)
-            {
-                EnsureSurgicalTool();
-                return;
-            }
+            if (_surgicalTool == null) { EnsureSurgicalTool(); return; }
 
             Transform tf = _visualizer != null ? _visualizer.transform : transform;
-            Vector3 bladeA = tf.InverseTransformPoint(_surgicalTool.BladeA);
-            Vector3 bladeB = tf.InverseTransformPoint(_surgicalTool.BladeB);
 
-            UpdateDebugLine(_surgicalTool.BladeA, _surgicalTool.BladeB);
+            // 当前刀刃端点 → local space
+            Vector3 bladeA_local = tf.InverseTransformPoint(_surgicalTool.BladeA);
+            Vector3 bladeB_local = tf.InverseTransformPoint(_surgicalTool.BladeB);
 
-            bool insideMesh = IsBladeNearMesh(bladeA, bladeB);
+            // 碰触检测: 刀刃(线段)是否接近肝脏
+            bool insideMesh = IsBladeNearMesh(bladeA_local, bladeB_local);
 
             if (insideMesh && !_wasInsideMesh)
             {
-                // Stroke start: clean cutter caches; the path sampler is
-                // reset so the new stroke does not inherit a tangent from
-                // the previous stroke's exit motion.
+                // 进入肝脏 — 开始切割 (不清除 edgeCache, 保持顶点共享)
                 _isCutting = true;
-                _cutter.ResetStroke();
-                _sampler.Reset();
+                _prevBladeA_local = bladeA_local;
+                _prevBladeB_local = bladeB_local;
+                _hasPrevBlade = true;
+                _cutter.ResetStroke(); // ★ 开始新stroke时重置锁定法线
+                Debug.Log("[CuttingToolV3] 碰触检测: 进入肝脏, 开始切割");
             }
-
-            if (insideMesh && _isCutting)
+            else if (!insideMesh && _wasInsideMesh)
             {
-                // Step 2 path smoothing: feed the latest in-tissue pose to
-                // the sampler. It dedups against the previous sample, runs
-                // Catmull-Rom over the four-sample window, and enqueues
-                // smoothed ribbon quads. We then drain them through the
-                // cutter in the order they were emitted.
-                _sampler.Push(bladeA, bladeB);
-                DrainSampler();
-            }
-
-            if (!insideMesh && _wasInsideMesh)
-            {
-                // Stroke end: flush the last linear segment so the trailing
-                // portion of the path inside the tissue still gets cut even
-                // though we never received a "post" sample after exit. The
-                // exit pose itself is intentionally NOT pushed -- doing so
-                // would extend the cut surface outside the mesh.
-                _sampler.Flush();
-                DrainSampler();
+                // ★ 出刀修复：离开肝脏的那一帧必须执行最后一刀！
+                // 不做这一刀，刀从最后一个 inside 位置到 outside 位置之间扫过的区域完全空白，
+                // 边缘残留的极小 sliver 四面体就永久卡在这个死区里，形成藕断丝连！
+                if (_hasPrevBlade)
+                {
+                    float lastMoveA = (bladeA_local - _prevBladeA_local).magnitude;
+                    float lastMoveB = (bladeB_local - _prevBladeB_local).magnitude;
+                    if (Mathf.Max(lastMoveA, lastMoveB) > 1e-5f)
+                        _cutter.Cut(_prevBladeA_local, _prevBladeB_local,
+                                    bladeA_local, bladeB_local);
+                }
                 _isCutting = false;
-                if (forceFlushOnExit) _forceFlushRequested = true;
+                _hasPrevBlade = false;
+                Debug.Log("[CuttingToolV3] 碰触检测: 离开肝脏（出刀最后一切完成）");
             }
 
             _wasInsideMesh = insideMesh;
+
+            if (!_isCutting || !_hasPrevBlade) return;
+
+            // 刀刃移动量
+            float moveA = (bladeA_local - _prevBladeA_local).magnitude;
+            float moveB = (bladeB_local - _prevBladeB_local).magnitude;
+            float maxMove = Mathf.Max(moveA, moveB);
+
+            if (maxMove < 1e-5f) return; // 没动
+
+            // 调用扫掠面切割
+            _cutter.Cut(_prevBladeA_local, _prevBladeB_local,
+                        bladeA_local, bladeB_local);
+
+            // 更新上帧
+            _prevBladeA_local = bladeA_local;
+            _prevBladeB_local = bladeB_local;
         }
 
-        void DrainSampler()
-        {
-            if (_cutter == null || _sampler == null) return;
-            bool hadEvents = false;
-            while (_sampler.TryDequeue(out var quad))
-            {
-                _cutter.ProtectStrokeBornTets = protectNewTetsForStroke;
-                _cutter.Cut(quad.A0, quad.B0, quad.A1, quad.B1);
-                hadEvents = true;
-            }
-
-            if (hadEvents) DrainCutSurfacePatches();
-        }
-
+        // ── 碰触检测: 刀刃线段是否接近肝脏 ──────────────────
         bool IsBladeNearMesh(Vector3 bladeA, Vector3 bladeB)
         {
-            return _cutter != null && _cutter.IsBladeNearMesh(bladeA, bladeB, contactRadius);
+            // 检测刀刃线段附近是否有 tet 顶点
+            // 不要使用 mf.mesh.bounds, 因为在软体形变时 Unity 的 Bounds 可能会缓存过时数据，导致切到一半停止！
+            float r2 = contactRadius * contactRadius;
+            Vector3 bladeMin = Vector3.Min(bladeA, bladeB) - Vector3.one * contactRadius;
+            Vector3 bladeMax = Vector3.Max(bladeA, bladeB) + Vector3.one * contactRadius;
+            for (int t = 0; t < _data.NumTets; t++)
+            {
+                if (!_data.TetActive[t]) continue;
+                int b = t * 4;
+                Vector3 v0 = _data.Positions[_data.TetIds[b]];
+                Vector3 v1 = _data.Positions[_data.TetIds[b+1]];
+                Vector3 v2 = _data.Positions[_data.TetIds[b+2]];
+                Vector3 v3 = _data.Positions[_data.TetIds[b+3]];
+                Vector3 tetMin = Vector3.Min(Vector3.Min(v0, v1), Vector3.Min(v2, v3));
+                Vector3 tetMax = Vector3.Max(Vector3.Max(v0, v1), Vector3.Max(v2, v3));
+
+                if (tetMin.x > bladeMax.x || tetMax.x < bladeMin.x ||
+                    tetMin.y > bladeMax.y || tetMax.y < bladeMin.y ||
+                    tetMin.z > bladeMax.z || tetMax.z < bladeMin.z)
+                    continue;
+
+                // 只要有任何一个顶点到线段距离小于 r2
+                if (PointSegDistSq(v0, bladeA, bladeB) < r2 ||
+                    PointSegDistSq(v1, bladeA, bladeB) < r2 ||
+                    PointSegDistSq(v2, bladeA, bladeB) < r2 ||
+                    PointSegDistSq(v3, bladeA, bladeB) < r2)
+                    return true;
+            }
+            return false;
         }
 
+        static float PointSegDistSq(Vector3 p, Vector3 a, Vector3 b)
+        {
+            Vector3 ab = b - a;
+            float sq = ab.sqrMagnitude;
+            if (sq < 1e-12f) return (p - a).sqrMagnitude;
+            float t = Mathf.Clamp01(Vector3.Dot(p - a, ab) / sq);
+            return (p - (a + ab * t)).sqrMagnitude;
+        }
+
+        // ══════════════════════════════════════════════════════
+        // 鼠标切割 (保留, 未改为扫掠面)
+        // ══════════════════════════════════════════════════════
         void MouseCutStep()
         {
-            // Kept as the old V3 placeholder. The active cutting path uses SurgicalTool.
-            if (_cam == null) _cam = Camera.main;
+            // TODO: Phase 2 — mouse切割也改为扫掠面
         }
 
+        // ══════════════════════════════════════════════════════
+        // FlushCutToGPU — SoftBody.FixedUpdate 调用
+        // ══════════════════════════════════════════════════════
         public void FlushCutToGPU()
         {
-            FlushCutToGPU(false);
-        }
-
-        void FlushCutToGPU(bool force)
-        {
             if (_data == null || _solver == null || _cutter == null) return;
+
             if (!_cutter.IsDirty) return;
 
             _framesSinceFlush++;
-            _framesSinceSurfaceUpdate++;
+            if (_framesSinceFlush < flushInterval) return;
 
-            bool topologyChanged = SurfaceTopologyChanged();
-            bool shouldUpdateSurface =
-                topologyChanged &&
-                (force || _forceFlushRequested || !_isCutting ||
-                 (rebuildSurfaceDuringStroke &&
-                  _framesSinceSurfaceUpdate >= Mathf.Max(1, surfaceUpdateInterval)));
-
-            if (shouldUpdateSurface)
+            // Legacy V3 bridge cleanup is expensive and mutates topology, so only run it before an actual GPU flush.
+            if (_cutter is TetSubdivisionCutter tCutter)
             {
-                UpdateSurface();
-                MarkSurfaceSynced();
-                _framesSinceSurfaceUpdate = 0;
+                tCutter.RemoveStretchedTets(5.0f, 0.003f); // Lowered absolute length to 3mm to catch tiny lotus roots
             }
 
-            bool shouldFlush = force || _forceFlushRequested || !_isCutting || flushDuringStroke;
-            if (!shouldFlush) return;
-            if (_isCutting && flushDuringStroke && _framesSinceFlush < Mathf.Max(1, flushInterval)) return;
-
-            var sw = System.Diagnostics.Stopwatch.StartNew();
+            SurfaceBuildResult surface = UpdateSurface();
             _cutter.FlushToGPU();
-            sw.Stop();
-            _lastGpuFlushMs = (float)sw.Elapsed.TotalMilliseconds;
-
-            if (SurfaceTopologyChanged())
-            {
-                UpdateSurface();
-                MarkSurfaceSynced();
-                _framesSinceSurfaceUpdate = 0;
-            }
+            ApplyVisibleSurface(surface);
             _framesSinceFlush = 0;
-            _forceFlushRequested = false;
         }
 
-        public int TotalSplitVerts => _cutter?.TotalNewVerts ?? 0;
-        public int TotalCutEdges => _cutter?.TotalNewTets ?? 0;
-        public int TotalCutTets => _cutter?.TotalCutTets ?? 0;
-        public bool ToolCutPressed => _isCutting;
-        public float LastToolMoveDistance => _cutter?.LastMoveDistance ?? 0f;
-        public int LastCandidateTetCount => _cutter?.LastCandidateTetCount ?? 0;
-        public int LastIntersectedTetCount => _cutter?.LastIntersectedTetCount ?? 0;
-        public string LastCutRejectReason => _cutter?.LastRejectReason ?? "no_cutter";
-        public int LastSeparatedVertexCount => _cutter?.LastSeparatedVertexCount ?? 0;
-        public int LastRemainingSharedVertexCount => _cutter?.LastRemainingSharedVertexCount ?? 0;
-        public float LastCutQueryMs => _cutter?.LastQueryMs ?? 0f;
-        public float LastCutSplitMs => _cutter?.LastSplitMs ?? 0f;
-        public float LastCutSeparateMs => _cutter?.LastSeparateMs ?? 0f;
-        public float LastSurfaceUpdateMs => _lastSurfaceUpdateMs;
-        public float LastGpuFlushMs => _lastGpuFlushMs;
+        // ── 诊断 GUI 属性 ────────────────────────────────────
+        public int    TotalSplitVerts         => _cutter?.TotalNewVerts         ?? 0;
+        public int    TotalCutEdges           => _cutter?.TotalNewTets          ?? 0;
+        public int    TotalCutTets            => _cutter?.TotalCutTets          ?? 0;
+        public bool   ToolCutPressed          => _isCutting;
+        public float  LastToolMoveDistance    => _cutter?.LastMoveDistance      ?? 0f;
+        public int    LastCandidateTetCount   => _cutter?.LastCandidateTetCount ?? 0;
+        public int    LastIntersectedTetCount => _cutter?.LastIntersectedTetCount ?? 0;
+        public string LastCutRejectReason     => _cutter?.LastRejectReason      ?? "no_cutter";
 
-        void UpdateSurface()
+        // ══════════════════════════════════════════════════════
+        SurfaceBuildResult UpdateSurface()
         {
-            if (_visualizer == null) return;
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-
-            if (_cutter != null &&
-                renderExplicitCutSurface &&
-                rebuildCutSurfaceFromActiveTopology &&
-                _cutter.CutSurfaceVertexIds.Count > 0)
-            {
-                SurfaceReconstructor.RebuildBoundarySurfaceSplitByCut(
+            if (_data == null) return default;
+            // SurfaceReconstructor 自动检测切口面 (count==1 边界面)
+            int[] originalSurfaceTris = HasOriginalSurfaceSupportData()
+                ? SurfaceReconstructor.RebuildOriginalSurfaceFromSupports(
                     _data,
-                    _cutter.CutFaceRegistry,
-                    _cutter.CutSurfaceVertexIds,
-                    _cutter.CutSurfaceEdgeKeys,
-                    _renderSurfaceTris,
-                    _renderCutTris,
-                    _cutter.CutSurfaceNormals);
-                _visualizer.SetNormalMergeExcludedVertices(_cutter.CutSurfaceVertexIds);
-                _visualizer.RebuildTopology(_renderSurfaceTris, _renderCutTris);
-                ClearLegacyCutSurfaceRenderer();
-            }
-            else
-            {
-                int[] tris = SurfaceReconstructor.RebuildSurface(_data);
-                _visualizer.SetNormalMergeExcludedVertices(null);
-                _visualizer.RebuildTopology(tris);
-                if (renderExplicitCutSurface && rebuildCutSurfaceFromActiveTopology)
-                    ClearLegacyCutSurfaceRenderer();
-                else
-                    RebuildExplicitCutSurfaceFromTopology();
-            }
+                    _cutter.SurfaceSupport0,
+                    _cutter.SurfaceSupport1,
+                    _cutter.SurfaceSupport2,
+                    _cutter.OriginalSurfaceFaceKeys)
+                : SurfaceReconstructor.RebuildSurface(_data);
 
-            sw.Stop();
-            _lastSurfaceUpdateMs = (float)sw.Elapsed.TotalMilliseconds;
+            if (originalSurfaceTris == null)
+                originalSurfaceTris = System.Array.Empty<int>();
+
+            int[] fullBoundaryTris = SurfaceReconstructor.RebuildSurface(_data);
+            _renderOriginalSurfaceTris.Clear();
+            _renderOriginalSurfaceTris.AddRange(originalSurfaceTris);
+            BuildCutTriangleList(fullBoundaryTris, originalSurfaceTris, _renderCutTris, _renderOriginalSurfaceKeys);
+
+            _data.SetSurfaceTriIds(originalSurfaceTris);
+            return new SurfaceBuildResult(originalSurfaceTris, _renderOriginalSurfaceTris, _renderCutTris);
         }
 
-        bool SurfaceTopologyChanged()
+        bool HasOriginalSurfaceSupportData()
         {
-            if (_cutter == null) return false;
-            return _surfaceSyncedNewVerts != _cutter.TotalNewVerts ||
-                   _surfaceSyncedNewTets != _cutter.TotalNewTets ||
-                   _surfaceSyncedCutTets != _cutter.TotalCutTets;
+            return _data != null &&
+                   _cutter != null &&
+                   _cutter.OriginalSurfaceFaceKeys != null &&
+                   _cutter.OriginalSurfaceFaceKeys.Count > 0 &&
+                   _cutter.SurfaceSupport0 != null &&
+                   _cutter.SurfaceSupport1 != null &&
+                   _cutter.SurfaceSupport2 != null;
         }
 
-        void MarkSurfaceSynced()
+        static void BuildCutTriangleList(
+            int[] fullBoundaryTris,
+            int[] originalSurfaceTris,
+            List<int> cutTris,
+            HashSet<long> originalKeys)
         {
-            if (_cutter == null)
-            {
-                _surfaceSyncedNewVerts = 0;
-                _surfaceSyncedNewTets = 0;
-                _surfaceSyncedCutTets = 0;
+            cutTris.Clear();
+            originalKeys.Clear();
+
+            if (fullBoundaryTris == null || fullBoundaryTris.Length < 3)
                 return;
+
+            if (originalSurfaceTris != null)
+            {
+                for (int i = 0; i + 2 < originalSurfaceTris.Length; i += 3)
+                    originalKeys.Add(SurfaceReconstructor.FaceKey(
+                        originalSurfaceTris[i + 0],
+                        originalSurfaceTris[i + 1],
+                        originalSurfaceTris[i + 2]));
             }
 
-            _surfaceSyncedNewVerts = _cutter.TotalNewVerts;
-            _surfaceSyncedNewTets = _cutter.TotalNewTets;
-            _surfaceSyncedCutTets = _cutter.TotalCutTets;
+            for (int i = 0; i + 2 < fullBoundaryTris.Length; i += 3)
+            {
+                int a = fullBoundaryTris[i + 0];
+                int b = fullBoundaryTris[i + 1];
+                int c = fullBoundaryTris[i + 2];
+                if (originalKeys.Contains(SurfaceReconstructor.FaceKey(a, b, c)))
+                    continue;
+
+                cutTris.Add(a);
+                cutTris.Add(b);
+                cutTris.Add(c);
+            }
         }
 
-        void DrainCutSurfacePatches()
+        void ApplyVisibleSurface(SurfaceBuildResult surface)
         {
-            if (_cutter == null) return;
+            if (_visualizer != null)
+                _visualizer.RebuildTopology(surface.OriginalSurfaceList, surface.CutTriList);
 
-            _cutPatchDrain.Clear();
-            _cutter.DrainCutSurfacePatches(_cutPatchDrain);
-            if (_cutPatchDrain.Count == 0) return;
-
-            if (rebuildCutSurfaceFromActiveTopology) return;
-            if (!renderExplicitCutSurface) return;
-            EnsureCutSurfaceRenderer();
-            if (_cutSurfaceRenderer == null) return;
-
-            for (int i = 0; i < _cutPatchDrain.Count; i++)
-            {
-                var patch = _cutPatchDrain[i];
-                _patchParticleIds.Clear();
-                for (int j = 0; j < patch.count; j++)
-                {
-                    int id = patch.IdAt(j);
-                    if (id >= 0) _patchParticleIds.Add(id);
-                }
-
-                _cutSurfaceRenderer.AddParticlePatch(
-                    _data,
-                    _patchParticleIds,
-                    patch.normal,
-                    patch.reverseWinding,
-                    rebuildMesh: false);
-            }
-
-            _cutSurfaceRenderer.RebuildNow();
+            SofaUnityVisualLiverRenderer renderer = ResolveSofaVisualRenderer();
+            if (renderer != null && renderer.IsInitialized)
+                renderer.RebuildTetSurfaceTopology(surface.OriginalSurfaceTris ?? System.Array.Empty<int>());
         }
 
-        void RebuildExplicitCutSurfaceFromTopology()
+        SofaUnityVisualLiverRenderer ResolveSofaVisualRenderer()
         {
-            if (!renderExplicitCutSurface || !rebuildCutSurfaceFromActiveTopology) return;
-            if (_cutter == null || _data == null) return;
-
-            EnsureCutSurfaceRenderer();
-            if (_cutSurfaceRenderer == null) return;
-
-            if (_cutter.CutFaceRegistry.CutFaceCount == 0)
-            {
-                _cutSurfaceRenderer.Clear();
-                return;
-            }
-
-            int[] cutTris = SurfaceReconstructor.RebuildCutBoundarySurface(
-                _data,
-                _cutter.CutFaceRegistry);
-            _cutSurfaceRenderer.SetParticleTriangles(
-                _data,
-                cutTris,
-                EffectiveCutSurfaceEdgeLimit());
+            if (_sofaVisualRenderer != null) return _sofaVisualRenderer;
+            _sofaVisualRenderer = GetComponent<SofaUnityVisualLiverRenderer>();
+            if (_sofaVisualRenderer == null && _visualizer != null)
+                _sofaVisualRenderer = _visualizer.GetComponentInParent<SofaUnityVisualLiverRenderer>();
+            return _sofaVisualRenderer;
         }
 
-        void EnsureCutSurfaceRenderer(bool clearExisting = false)
+        readonly struct SurfaceBuildResult
         {
-            if (!renderExplicitCutSurface)
+            public readonly int[] OriginalSurfaceTris;
+            public readonly List<int> OriginalSurfaceList;
+            public readonly List<int> CutTriList;
+
+            public SurfaceBuildResult(int[] originalSurfaceTris, List<int> originalSurfaceList, List<int> cutTriList)
             {
-                _cutSurfaceRenderer = null;
-                return;
+                OriginalSurfaceTris = originalSurfaceTris ?? System.Array.Empty<int>();
+                OriginalSurfaceList = originalSurfaceList ?? new List<int>();
+                CutTriList = cutTriList ?? new List<int>();
             }
-
-            Transform parent = _visualizer != null ? _visualizer.transform : transform;
-            Transform existing = parent.Find("CutSurfaceV3");
-            GameObject go;
-            if (existing != null)
-            {
-                go = existing.gameObject;
-            }
-            else
-            {
-                go = new GameObject("CutSurfaceV3");
-                go.transform.SetParent(parent, false);
-            }
-
-            go.SetActive(true);
-            go.transform.localPosition = Vector3.zero;
-            go.transform.localRotation = Quaternion.identity;
-            go.transform.localScale = Vector3.one;
-
-            _cutSurfaceRenderer = go.GetComponent<CutSurfaceRenderer>();
-            if (_cutSurfaceRenderer == null)
-                _cutSurfaceRenderer = go.AddComponent<CutSurfaceRenderer>();
-
-            _cutSurfaceRenderer.maxRuntimeEdgeLength = EffectiveCutSurfaceEdgeLimit();
-
-            if (clearExisting)
-                _cutSurfaceRenderer.Clear();
-        }
-
-        void ClearLegacyCutSurfaceRenderer()
-        {
-            if (_cutSurfaceRenderer != null)
-            {
-                _cutSurfaceRenderer.Clear();
-                _cutSurfaceRenderer.gameObject.SetActive(false);
-                _cutSurfaceRenderer = null;
-                return;
-            }
-
-            Transform parent = _visualizer != null ? _visualizer.transform : transform;
-            Transform existing = parent != null ? parent.Find("CutSurfaceV3") : null;
-            if (existing == null) return;
-            var renderer = existing.GetComponent<CutSurfaceRenderer>();
-            if (renderer != null) renderer.Clear();
-            existing.gameObject.SetActive(false);
-        }
-
-        float EffectiveCutSurfaceEdgeLimit()
-        {
-            if (rebuildCutSurfaceFromActiveTopology) return 0f;
-            if (maxRenderedCutSurfaceEdge <= 0f) return 0f;
-            return maxRenderedCutSurfaceEdge;
         }
 
         void EnsureSurgicalTool()
         {
             if (_surgicalTool != null) return;
-            _surgicalTool = GetComponent<SurgicalTool>() ?? gameObject.AddComponent<SurgicalTool>();
+            _surgicalTool = GetComponent<SurgicalTool>()
+                         ?? gameObject.AddComponent<SurgicalTool>();
         }
 
         void SetupDebugLine()
         {
-            if (_debugLine != null) return;
-
-            _debugLine = GetComponent<LineRenderer>();
-            if (_debugLine == null) _debugLine = gameObject.AddComponent<LineRenderer>();
-
-            _debugLine.startWidth = 0.003f;
-            _debugLine.endWidth = 0.001f;
+            if (GetComponent<LineRenderer>()) return;
+            _debugLine = gameObject.AddComponent<LineRenderer>();
+            _debugLine.startWidth = 0.003f; _debugLine.endWidth = 0.001f;
             _debugLine.material = new Material(Shader.Find("Sprites/Default"));
-            _debugLine.startColor = Color.cyan;
-            _debugLine.endColor = Color.yellow;
-            _debugLine.positionCount = 2;
-            _debugLine.enabled = false;
-        }
-
-        void UpdateDebugLine(Vector3 a, Vector3 b)
-        {
-            if (!showDebugRay || _debugLine == null) return;
-            _debugLine.enabled = true;
-            _debugLine.SetPosition(0, a);
-            _debugLine.SetPosition(1, b);
+            _debugLine.startColor = Color.cyan; _debugLine.endColor = Color.yellow;
+            _debugLine.positionCount = 2; _debugLine.enabled = false;
         }
 
         void OnDestroy()
         {
-            if (_debugLine != null && _debugLine.material != null) Destroy(_debugLine.material);
+            if (_debugLine && _debugLine.material) Destroy(_debugLine.material);
         }
     }
 }

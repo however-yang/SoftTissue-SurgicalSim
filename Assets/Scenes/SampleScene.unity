@@ -420,8 +420,8 @@ MonoBehaviour:
   toolContactCouplingPasses: 3
   useToolContactCandidateCulling: 1
   toolContactCandidatePadding: 0.06
-  enableGrasping: 1
-  enableCutting: 0
+  enableGrasping: 0
+  enableCutting: 1
   cutRadius: 0.0047
   virtualBladeRadius: 0.0025
   interiorColor: {r: 0.21960784, g: 0.21960784, b: 0.21960784, a: 1}

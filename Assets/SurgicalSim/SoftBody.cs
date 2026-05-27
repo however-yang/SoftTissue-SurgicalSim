@@ -80,7 +80,7 @@ namespace SurgicalSim
 
         [Header("Grasping")]
         [Tooltip("Enable gripper visual, GPU tool collision, and particle grasping. Disable for performance isolation.")]
-        public bool enableGrasping = true;
+        public bool enableGrasping = false;
 
         [Header("Performance")]
         [Tooltip("Limit Unity FixedUpdate catch-up so a slow contact step does not run several physics steps before one rendered frame.")]
@@ -90,9 +90,20 @@ namespace SurgicalSim
         [Range(1, 5)]
         public int maxFixedUpdatesPerRenderedFrame = 1;
 
+        [Tooltip("Use AsyncGPUReadback for particle positions. This avoids a blocking ComputeBuffer.GetData every physics step.")]
+        public bool useAsyncPositionReadback = true;
+
         [Header("切割")]
         [Tooltip("啟用鼠標拖拽切割")]
-        public bool enableCutting = false;
+        public bool enableCutting = true;
+
+        public enum CuttingBackend
+        {
+            V3 = 0
+        }
+
+        [Tooltip("Runtime cutting backend. V3 is the restored performant progressive tetrahedral cutter.")]
+        public CuttingBackend cuttingBackend = CuttingBackend.V3;
 
         [Tooltip("切割影響半徑")]
         [Range(0.003f, 0.05f)]
@@ -350,10 +361,15 @@ namespace SurgicalSim
             // 初始化切割工具
             if (enableCutting)
             {
+                cuttingBackend = CuttingBackend.V3;
+                DisableOptionalCuttingV4Component();
+
                 _cuttingTool = GetComponent<CuttingToolV3>();
                 if (_cuttingTool == null)
                     _cuttingTool = gameObject.AddComponent<CuttingToolV3>();
+                _cuttingTool.enabled = true;
                 _cuttingTool.cutRadius = cutRadius;
+                _cuttingTool.flushInterval = Mathf.Max(_cuttingTool.flushInterval, 2);
                 _cuttingTool.Init(data, _gpuSolver, _visualizer);
             }
 
@@ -398,7 +414,7 @@ namespace SurgicalSim
             ApplyFixedUpdateCatchUpLimit();
 
             // ★ 切割: 在物理步之前上传脏 buffer 到 GPU
-            if (_cuttingTool != null)
+            if (_cuttingTool != null && _cuttingTool.enabled)
             {
                 try
                 {
@@ -406,10 +422,9 @@ namespace SurgicalSim
                 }
                 catch (System.Exception ex)
                 {
-                    Debug.LogError($"[SoftBody] FlushCutToGPU 異常: {ex.Message}\n{ex.StackTrace}");
+                    Debug.LogError($"[SoftBody] CuttingV3 FlushCutToGPU exception: {ex.Message}\n{ex.StackTrace}");
                 }
             }
-
             // 找一个非固定粒子来诊断
             int diagIdx = 0;
             for (int i = 0; i < _data.NumParticles; i++)
@@ -459,7 +474,10 @@ namespace SurgicalSim
                 _lastSolveDispatchMs = (float)partSw.Elapsed.TotalMilliseconds;
 
                 partSw.Restart();
-                _gpuSolver.ReadbackPositions(_data);
+                if (useAsyncPositionReadback)
+                    _gpuSolver.RequestPositionReadback(_data);
+                else
+                    _gpuSolver.ReadbackPositions(_data);
                 partSw.Stop();
                 _lastReadbackMs = (float)partSw.Elapsed.TotalMilliseconds;
                 sw.Stop();
@@ -504,12 +522,17 @@ namespace SurgicalSim
             _physicsFrame++;
 
             var visualSw = System.Diagnostics.Stopwatch.StartNew();
-            if (!(_sofaVisualRenderer != null &&
-                  _sofaVisualRenderer.IsInitialized &&
-                  hideTetSurfaceWhenSofaVisualActive))
-            {
+            bool sofaVisualHidesTetSurface =
+                _sofaVisualRenderer != null &&
+                _sofaVisualRenderer.IsInitialized &&
+                hideTetSurfaceWhenSofaVisualActive;
+            bool refreshTetVisualizer =
+                !sofaVisualHidesTetSurface ||
+                (_visualizer != null && _visualizer.HasCutSurfaceSubmesh);
+
+            if (refreshTetVisualizer && _visualizer != null)
                 _visualizer.Refresh();
-            }
+
             _sofaVisualRenderer?.Refresh();
             visualSw.Stop();
             _lastVisualRefreshMs = (float)visualSw.Elapsed.TotalMilliseconds;
@@ -541,6 +564,9 @@ namespace SurgicalSim
 
         void Update()
         {
+            float dt = Time.unscaledDeltaTime;
+            if (dt > 0f) _fps = _fps * 0.9f + (1f / dt) * 0.1f;
+
             if (Input.GetKeyDown(KeyCode.P))
             {
                 pausePhysics = !pausePhysics;
@@ -1151,8 +1177,18 @@ namespace SurgicalSim
             _gpuSolver?.Init(_data);
 
             // 重新初始化切割工具
-            if (_cuttingTool != null)
-                _cuttingTool.Init(_data, _gpuSolver, _visualizer);  // V3 reinit
+            if (enableCutting)
+            {
+                cuttingBackend = CuttingBackend.V3;
+                DisableOptionalCuttingV4Component();
+
+                if (_cuttingTool == null)
+                    _cuttingTool = GetComponent<CuttingToolV3>() ?? gameObject.AddComponent<CuttingToolV3>();
+                _cuttingTool.enabled = true;
+                _cuttingTool.cutRadius = cutRadius;
+                _cuttingTool.flushInterval = Mathf.Max(_cuttingTool.flushInterval, 2);
+                _cuttingTool.Init(_data, _gpuSolver, _visualizer);
+            }
 
             // 重新初始化夹爪工具
             if (enableGrasping && _gripperTool != null)
@@ -1181,33 +1217,24 @@ namespace SurgicalSim
             if (!showStats || _data == null) return;
 
             // FPS 平滑计算
-            float dt = Time.unscaledDeltaTime;
-            if (dt > 0f) _fps = _fps * 0.9f + (1f / dt) * 0.1f;
-
             var style = new GUIStyle(GUI.skin.box) { fontSize = 13 };
             style.normal.textColor = Color.white;
             style.alignment = TextAnchor.UpperLeft;
 
-            int splitVerts = _cuttingTool != null ? _cuttingTool.TotalSplitVerts : 0;
-            int cutTets    = _cuttingTool != null ? _cuttingTool.TotalCutTets : 0;
-            bool toolPressed = _cuttingTool != null && _cuttingTool.ToolCutPressed;
-            float cutMoveDist = _cuttingTool != null ? _cuttingTool.LastToolMoveDistance : 0f;
-            int cutCandidates = _cuttingTool != null ? _cuttingTool.LastCandidateTetCount : 0;
-            int cutHits = _cuttingTool != null ? _cuttingTool.LastIntersectedTetCount : 0;
-            string cutReason = _cuttingTool != null ? _cuttingTool.LastCutRejectReason : "no_tool";
-            int cutSeparated = _cuttingTool != null ? _cuttingTool.LastSeparatedVertexCount : 0;
-            int cutRemainingShared = _cuttingTool != null ? _cuttingTool.LastRemainingSharedVertexCount : 0;
-            float cutQueryMs = _cuttingTool != null ? _cuttingTool.LastCutQueryMs : 0f;
-            float cutSplitMs = _cuttingTool != null ? _cuttingTool.LastCutSplitMs : 0f;
-            float cutSeparateMs = _cuttingTool != null ? _cuttingTool.LastCutSeparateMs : 0f;
-            float surfaceMs = _cuttingTool != null ? _cuttingTool.LastSurfaceUpdateMs : 0f;
-            float gpuFlushMs = _cuttingTool != null ? _cuttingTool.LastGpuFlushMs : 0f;
+            bool usingV3 = _cuttingTool != null && _cuttingTool.enabled;
+            int splitVerts = usingV3 ? _cuttingTool.TotalSplitVerts : 0;
+            int cutTets    = usingV3 ? _cuttingTool.TotalCutTets : 0;
+            bool toolPressed = usingV3 && _cuttingTool.ToolCutPressed;
+            float cutMoveDist = usingV3 ? _cuttingTool.LastToolMoveDistance : 0f;
+            int cutCandidates = usingV3 ? _cuttingTool.LastCandidateTetCount : 0;
+            int cutHits = usingV3 ? _cuttingTool.LastIntersectedTetCount : 0;
+            string cutReason = usingV3 ? _cuttingTool.LastCutRejectReason : "no_tool";
 
             // FPS 颜色标记
             string fpsColor = _fps >= 30 ? "#00FF00" : (_fps >= 15 ? "#FFFF00" : "#FF0000");
             string info =
                 $"<color={fpsColor}>FPS: {_fps:F0}</color>\n" +
-                $"XPBD GPU | Tet Subdivision Cut (PG2025)\n" +
+                $"XPBD GPU | Cutting V3 (PG2025)\n" +
                 $"粒子:    {_data.NumParticles:N0}\n" +
                 $"四面體:  {_data.NumTets:N0}\n" +
                 $"子步數:  {numSubSteps}\n" +
@@ -1229,11 +1256,17 @@ namespace SurgicalSim
                 $"刀状态: {toolPressed}\n" +
                 $"move: {cutMoveDist:E2}\n" +
                 $"cand/hit: {cutCandidates}/{cutHits}\n" +
-                $"sep/rem: {cutSeparated}/{cutRemainingShared}\n" +
-                $"cut ms q/s/p: {cutQueryMs:F1}/{cutSplitMs:F1}/{cutSeparateMs:F1}\n" +
-                $"surf/gpu: {surfaceMs:F1}/{gpuFlushMs:F1} ms\n" +
                 $"reason: {cutReason}";
-            GUI.Box(new Rect(10, 255, 230, 145), cutDebug, style);
+            GUI.Box(new Rect(10, 255, 300, 190), cutDebug, style);
+        }
+
+        void DisableOptionalCuttingV4Component()
+        {
+            var v4Type = System.Type.GetType("SurgicalSim.CuttingV4.CuttingToolV4, Assembly-CSharp");
+            if (v4Type == null) return;
+
+            var v4 = GetComponent(v4Type) as Behaviour;
+            if (v4 != null) v4.enabled = false;
         }
     }
 }

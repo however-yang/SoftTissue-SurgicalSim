@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace SurgicalSim.Physics
 {
@@ -47,6 +48,13 @@ namespace SurgicalSim.Physics
         int _numP, _numT, _numE, _numSurfaceTris;
         const int TH = 64;
         Vector4[] _readBuf;
+        Vector4[] _velReadBuf;
+        Vector4[] _prevReadBuf;
+        bool _positionReadbackPending;
+        int _readbackGeneration;
+        int[] _tetActiveUpload;
+        int[] _edgeActiveUpload;
+        readonly HashSet<long> _realtimeActiveEdgeKeys = new HashSet<long>();
 
         List<int>[] _edgeToTets;
         int[] _surfaceGroupOff, _surfaceGroupCnt; int _numSurfaceColors;
@@ -78,6 +86,7 @@ namespace SurgicalSim.Physics
                   Mathf.Max(1, ToolContactIterations) *
                   (UseToolContactCandidateCulling ? _activeToolSurfaceCandidateColors : _numSurfaceColors)
                 : 0;
+        public float LastRealtimeTopologySyncMs { get; private set; }
 
         [System.Runtime.InteropServices.StructLayout(
             System.Runtime.InteropServices.LayoutKind.Sequential)]
@@ -109,6 +118,7 @@ namespace SurgicalSim.Physics
         // ══════════════════════════════════════════════════════
         public void Init(Core.TetMeshData data)
         {
+            InvalidatePendingReadbacks();
             _numP = data.NumParticles;
             _numT = data.NumTets;
             _numSurfaceTris = data.NumSurfaceTris;
@@ -198,8 +208,8 @@ namespace SurgicalSim.Physics
             }
 
             // mass → invMass
-            // ★ Step 3 (cut debris fix): compute the average MASS
-            // (not invMass) using the median-ish "robust" mean, then
+            // Compute the average MASS (not invMass) using the
+            // median-ish "robust" mean, then
             // enforce a hard mass floor at avgMass / 100 to absolutely
             // bound the worst-case inverse mass. Averaging invMass
             // directly is non-robust: a single 1e-11 m^3 sliver tet
@@ -310,6 +320,10 @@ namespace SurgicalSim.Physics
             }
 
             _readBuf = new Vector4[_numP];
+            _velReadBuf = new Vector4[_numP];
+            _prevReadBuf = new Vector4[_numP];
+            _tetActiveUpload = new int[_numT];
+            _edgeActiveUpload = new int[_numE];
             BindAll();
 
             // CPU 端状态
@@ -495,9 +509,37 @@ namespace SurgicalSim.Physics
 
         public void ReadbackPositions(Core.TetMeshData data)
         {
+            EnsureReadbackBuffers();
             _bufPos.GetData(_readBuf);
             for (int i = 0; i < _numP; i++)
                 data.Positions[i] = new Vector3(_readBuf[i].x, _readBuf[i].y, _readBuf[i].z);
+        }
+
+        public bool RequestPositionReadback(Core.TetMeshData data)
+        {
+            if (data == null || _bufPos == null) return false;
+            if (!SystemInfo.supportsAsyncGPUReadback)
+            {
+                ReadbackPositions(data);
+                return true;
+            }
+
+            if (_positionReadbackPending) return false;
+            _positionReadbackPending = true;
+            int count = _numP;
+            int generation = _readbackGeneration;
+            AsyncGPUReadback.Request(_bufPos, request =>
+            {
+                if (generation != _readbackGeneration) return;
+                _positionReadbackPending = false;
+                if (request.hasError || data.Positions == null) return;
+
+                var src = request.GetData<Vector4>();
+                int n = Mathf.Min(count, Mathf.Min(src.Length, data.NumParticles));
+                for (int i = 0; i < n; i++)
+                    data.Positions[i] = new Vector3(src[i].x, src[i].y, src[i].z);
+            });
+            return true;
         }
 
         /// <summary>
@@ -506,22 +548,39 @@ namespace SurgicalSim.Physics
         /// </summary>
         public void ReadbackAll(Core.TetMeshData data)
         {
+            InvalidatePendingReadbacks();
+            EnsureReadbackBuffers();
+
             // 位置
             _bufPos.GetData(_readBuf);
             for (int i = 0; i < _numP; i++)
                 data.Positions[i] = new Vector3(_readBuf[i].x, _readBuf[i].y, _readBuf[i].z);
 
             // 速度
-            var velBuf = new Vector4[_numP];
-            _bufVel.GetData(velBuf);
+            _bufVel.GetData(_velReadBuf);
             for (int i = 0; i < _numP; i++)
-                data.Velocities[i] = new Vector3(velBuf[i].x, velBuf[i].y, velBuf[i].z);
+                data.Velocities[i] = new Vector3(_velReadBuf[i].x, _velReadBuf[i].y, _velReadBuf[i].z);
 
             // 上一帧位置
-            var prevBuf = new Vector4[_numP];
-            _bufPrevPos.GetData(prevBuf);
+            _bufPrevPos.GetData(_prevReadBuf);
             for (int i = 0; i < _numP; i++)
-                data.PrevPositions[i] = new Vector3(prevBuf[i].x, prevBuf[i].y, prevBuf[i].z);
+                data.PrevPositions[i] = new Vector3(_prevReadBuf[i].x, _prevReadBuf[i].y, _prevReadBuf[i].z);
+        }
+
+        void EnsureReadbackBuffers()
+        {
+            if (_readBuf == null || _readBuf.Length != _numP)
+                _readBuf = new Vector4[_numP];
+            if (_velReadBuf == null || _velReadBuf.Length != _numP)
+                _velReadBuf = new Vector4[_numP];
+            if (_prevReadBuf == null || _prevReadBuf.Length != _numP)
+                _prevReadBuf = new Vector4[_numP];
+        }
+
+        void InvalidatePendingReadbacks()
+        {
+            unchecked { _readbackGeneration++; }
+            _positionReadbackPending = false;
         }
 
         public void UploadPositionsAndVelocities(Core.TetMeshData data)
@@ -739,23 +798,64 @@ namespace SurgicalSim.Physics
 
         public void UploadTetActiveBuffer(bool[] ta)
         {
-            var a = new int[_numT];
-            for (int i = 0; i < _numT; i++) a[i] = ta[i] ? 1 : 0;
-            _bufTetActive.SetData(a);
+            UploadTetActiveBuffer(ta, disableEdgesTouchingInactiveTet: false);
+        }
+
+        void UploadTetActiveBuffer(
+            bool[] ta,
+            bool disableEdgesTouchingInactiveTet,
+            Core.TetMeshData currentTopology = null)
+        {
+            if (ta == null || _bufTetActive == null) return;
+            if (_tetActiveUpload == null || _tetActiveUpload.Length != _numT)
+                _tetActiveUpload = new int[_numT];
+            if (_tetActive == null || _tetActive.Length != _numT)
+                _tetActive = new bool[_numT];
+
+            for (int i = 0; i < _numT; i++)
+            {
+                bool active = i < ta.Length && ta[i];
+                _tetActive[i] = active;
+                _tetActiveUpload[i] = active ? 1 : 0;
+            }
+            _bufTetActive.SetData(_tetActiveUpload);
 
             if (_edgeToTets != null)
             {
-                var ea = new int[_numE];
+                HashSet<long> activeEdgeKeys = null;
+                if (currentTopology != null && _edgeIdsFlat != null)
+                {
+                    BuildActiveEdgeKeys(currentTopology, Mathf.Min(_numT, currentTopology.NumTets), _realtimeActiveEdgeKeys);
+                    activeEdgeKeys = _realtimeActiveEdgeKeys;
+                }
+
+                if (_edgeActiveUpload == null || _edgeActiveUpload.Length != _numE)
+                    _edgeActiveUpload = new int[_numE];
+                if (_edgeActive == null || _edgeActive.Length != _numE)
+                    _edgeActive = new bool[_numE];
+
                 for (int e = 0; e < _numE; e++)
                 {
-                    bool active = false;
+                    bool hasActive = false;
+                    bool hasInactive = false;
                     foreach (int t in _edgeToTets[e])
                     {
-                        if (ta[t]) { active = true; break; }
+                        bool activeTet = t >= 0 && t < ta.Length && ta[t];
+                        hasActive |= activeTet;
+                        hasInactive |= !activeTet;
                     }
-                    ea[e] = active ? 1 : 0;
+
+                    bool edgeActive = hasActive && (!disableEdgesTouchingInactiveTet || !hasInactive);
+                    if (edgeActive && activeEdgeKeys != null)
+                    {
+                        int a = _edgeIdsFlat[e * 2 + 0];
+                        int b = _edgeIdsFlat[e * 2 + 1];
+                        edgeActive = activeEdgeKeys.Contains(RealtimeEdgeKey(a, b));
+                    }
+                    _edgeActive[e] = edgeActive;
+                    _edgeActiveUpload[e] = edgeActive ? 1 : 0;
                 }
-                _bufEdgeActive.SetData(ea);
+                _bufEdgeActive.SetData(_edgeActiveUpload);
             }
         }
 
@@ -771,8 +871,152 @@ namespace SurgicalSim.Physics
             UploadTetActiveBuffer(ta);
         }
 
+        public void ApplyRealtimeCutState(Core.TetMeshData data)
+        {
+            if (data == null || _bufTetActive == null || _bufTetIds == null) return;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+
+            // If cutting appended particles/tets, the current GPU solver does
+            // not yet have rest volumes, edge constraints, or color groups for
+            // them. During the stroke, sync only the old topology's inactive
+            // flags and cut edges; the stroke-exit rebuild installs children.
+            bool topologySizeChanged = data.NumParticles != _numP || data.NumTets != _numT;
+            if (topologySizeChanged)
+            {
+                UploadTetActiveBuffer(data.TetActive, disableEdgesTouchingInactiveTet: true, currentTopology: data);
+                BindAll();
+                sw.Stop();
+                LastRealtimeTopologySyncMs = (float)sw.Elapsed.TotalMilliseconds;
+                return;
+            }
+
+            EnsureRealtimeParticleBuffers(data);
+            int tetCount = Mathf.Min(_numT, data.NumTets);
+            if (tetCount > 0)
+                _bufTetIds.SetData(ToU4(data.TetIds, tetCount));
+            UploadTetActiveBuffer(data.TetActive, disableEdgesTouchingInactiveTet: true, currentTopology: data);
+            BindAll();
+
+            sw.Stop();
+            LastRealtimeTopologySyncMs = (float)sw.Elapsed.TotalMilliseconds;
+        }
+
+        public void RebuildTopologyFromCpuState(Core.TetMeshData data)
+        {
+            if (data == null) return;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            Dispose();
+            Init(data);
+            sw.Stop();
+            LastRealtimeTopologySyncMs = (float)sw.Elapsed.TotalMilliseconds;
+        }
+
+        public int DisableEdgesByKeys(ICollection<long> edgeKeys, long keyBase = 1000000L)
+        {
+            if (edgeKeys == null || edgeKeys.Count == 0 || _edgeIdsFlat == null || _edgeActive == null)
+                return 0;
+
+            int disabled = 0;
+            for (int e = 0; e < _numE; e++)
+            {
+                int a = _edgeIdsFlat[e * 2 + 0];
+                int b = _edgeIdsFlat[e * 2 + 1];
+                if (a > b) { int tmp = a; a = b; b = tmp; }
+                long key = (long)a * keyBase + b;
+                if (!edgeKeys.Contains(key) || !_edgeActive[e]) continue;
+                _edgeActive[e] = false;
+                disabled++;
+            }
+
+            if (disabled > 0 && _bufEdgeActive != null)
+            {
+                if (_edgeActiveUpload == null || _edgeActiveUpload.Length != _numE)
+                    _edgeActiveUpload = new int[_numE];
+                for (int i = 0; i < _numE; i++)
+                    _edgeActiveUpload[i] = _edgeActive[i] ? 1 : 0;
+                _bufEdgeActive.SetData(_edgeActiveUpload);
+            }
+
+            return disabled;
+        }
+
+        void BuildActiveEdgeKeys(Core.TetMeshData data, int tetLimit, HashSet<long> dst)
+        {
+            dst.Clear();
+            if (data == null || data.TetIds == null || data.TetActive == null) return;
+
+            int limit = Mathf.Min(tetLimit, data.NumTets);
+            for (int t = 0; t < limit; t++)
+            {
+                if (!data.TetActive[t]) continue;
+                int b = t * 4;
+                int i0 = data.TetIds[b + 0];
+                int i1 = data.TetIds[b + 1];
+                int i2 = data.TetIds[b + 2];
+                int i3 = data.TetIds[b + 3];
+
+                dst.Add(RealtimeEdgeKey(i0, i1));
+                dst.Add(RealtimeEdgeKey(i0, i2));
+                dst.Add(RealtimeEdgeKey(i0, i3));
+                dst.Add(RealtimeEdgeKey(i1, i2));
+                dst.Add(RealtimeEdgeKey(i1, i3));
+                dst.Add(RealtimeEdgeKey(i2, i3));
+            }
+        }
+
+        static long RealtimeEdgeKey(int a, int b)
+        {
+            if (a > b)
+            {
+                int tmp = a;
+                a = b;
+                b = tmp;
+            }
+            return (long)a * 200000L + b;
+        }
+
+        void EnsureRealtimeParticleBuffers(Core.TetMeshData data)
+        {
+            int targetP = data.NumParticles;
+            if (targetP <= 0) return;
+
+            bool recreate = targetP != _numP ||
+                            _bufPos == null ||
+                            _bufPrevPos == null ||
+                            _bufVel == null ||
+                            _bufInvMass == null;
+            _numP = targetP;
+
+            Vector4[] pos = ToV4(data.Positions, _numP);
+            Vector4[] prev = ToV4(data.PrevPositions, _numP);
+            Vector4[] vel = ToV4(data.Velocities, _numP);
+            float[] invMass = new float[_numP];
+            Array.Copy(data.InvMass, invMass, _numP);
+
+            if (recreate)
+            {
+                InvalidatePendingReadbacks();
+                _bufPos?.Release();
+                _bufPrevPos?.Release();
+                _bufVel?.Release();
+                _bufInvMass?.Release();
+                _bufPos = MkV4(pos);
+                _bufPrevPos = MkV4(prev);
+                _bufVel = MkV4(vel);
+                _bufInvMass = MkF(invMass);
+                EnsureReadbackBuffers();
+                return;
+            }
+
+            _bufPos.SetData(pos);
+            _bufPrevPos.SetData(prev);
+            _bufVel.SetData(vel);
+            _bufInvMass.SetData(invMass);
+        }
+
         public void Dispose()
         {
+            InvalidatePendingReadbacks();
             _bufPos?.Release(); _bufPrevPos?.Release(); _bufVel?.Release();
             _bufInvMass?.Release(); _bufTetIds?.Release(); _bufRestVol?.Release();
             _bufTetActive?.Release(); _bufEdgeIds?.Release(); _bufRestLen?.Release();
@@ -788,6 +1032,7 @@ namespace SurgicalSim.Physics
         public int[] EdgeIds => _edgeIdsFlat;
         public int NumEdges => _numE;
         public int NumParticles => _numP;
+        public int NumTets => _numT;
         public bool[] EdgeActive => _edgeActive;
         public bool[] TetActive => _tetActive;
 
@@ -804,29 +1049,6 @@ namespace SurgicalSim.Physics
             var eaBuf = new int[_numE];
             for (int i = 0; i < _numE; i++) eaBuf[i] = _edgeActive[i] ? 1 : 0;
             _bufEdgeActive.SetData(eaBuf);
-
-            if (_edgeToTets != null)
-            {
-                var tetDisabledCount = new int[_numT];
-                for (int e = 0; e < _numE; e++)
-                {
-                    if (!_edgeActive[e])
-                        foreach (int t in _edgeToTets[e])
-                            tetDisabledCount[t]++;
-                }
-                for (int t = 0; t < _numT; t++)
-                {
-                    if (tetDisabledCount[t] >= 3)
-                        _tetActive[t] = false;
-                }
-                if (tetActiveOverride != null)
-                    for (int t = 0; t < _numT; t++)
-                        if (!tetActiveOverride[t]) _tetActive[t] = false;
-
-                var taBuf = new int[_numT];
-                for (int t = 0; t < _numT; t++) taBuf[t] = _tetActive[t] ? 1 : 0;
-                _bufTetActive.SetData(taBuf);
-            }
         }
 
         public void DisableEdgesOnly(HashSet<int> edgeIndices)

@@ -83,6 +83,7 @@ namespace SurgicalSim.Rendering
 
         TetMeshData _data;
         bool _usesTetSurfaceGeometry;
+        bool _usesRuntimeTetSurfaceTopology;
         int _boundParticleCount = -1;
         int _boundTetCount = -1;
         int _boundSurfaceTriLength = -1;
@@ -117,6 +118,7 @@ namespace SurgicalSim.Rendering
             _usesTetSurfaceGeometry = useTetSurfaceGeometry &&
                                       data.SurfaceTriIds != null &&
                                       data.SurfaceTriIds.Length >= 3;
+            _usesRuntimeTetSurfaceTopology = false;
 
             if (!_usesTetSurfaceGeometry && (_sourceVertices == null || _triangles == null))
             {
@@ -222,6 +224,13 @@ namespace SurgicalSim.Rendering
             _material = material;
             if (_meshRenderer != null)
                 _meshRenderer.sharedMaterial = material;
+        }
+
+        public void RebuildTetSurfaceTopology(IList<int> surfaceTriangles)
+        {
+            if (!_usesTetSurfaceGeometry || _data == null || _mesh == null) return;
+
+            BuildTetSurfaceMesh(_data, surfaceTriangles, runtimeTopology: true);
         }
 
         public static Material CreateProject2Liver2Material(Texture2D albedo, Texture2D bumpMap, Texture2D heightMap)
@@ -364,6 +373,11 @@ namespace SurgicalSim.Rendering
 
         void BuildTetSurfaceMesh(TetMeshData data)
         {
+            BuildTetSurfaceMesh(data, data.SurfaceTriIds, runtimeTopology: false);
+        }
+
+        void BuildTetSurfaceMesh(TetMeshData data, IList<int> surfaceTriangles, bool runtimeTopology)
+        {
             int count = data.NumParticles;
             _bindings = null;
             _sourceVertices = null;
@@ -374,9 +388,11 @@ namespace SurgicalSim.Rendering
             Array.Copy(data.RestPositions, _restVertices, count);
             Array.Copy(data.Positions, _deformedVertices, count);
 
-            _triangles = (int[])data.SurfaceTriIds.Clone();
-            int fallbackFaces;
-            int flipped = OrientSurfaceTrianglesFromTetTopology(data, _restVertices, _triangles, out fallbackFaces);
+            _triangles = CopyTriangles(surfaceTriangles);
+            int fallbackFaces = 0;
+            int flipped = runtimeTopology
+                ? 0
+                : OrientSurfaceTrianglesFromTetTopology(data, _restVertices, _triangles, out fallbackFaces);
             _uvs = BuildSofaProjectionUVs(_restVertices, count, _surfaceUvTiling);
 
             _mesh.Clear();
@@ -392,32 +408,42 @@ namespace SurgicalSim.Rendering
 
             _boundParticleCount = data.NumParticles;
             _boundTetCount = data.NumTets;
-            _boundSurfaceTriLength = data.SurfaceTriIds.Length;
-            _boundSurfaceTriRef = data.SurfaceTriIds;
+            _boundSurfaceTriLength = _triangles.Length;
+            _boundSurfaceTriRef = runtimeTopology ? null : data.SurfaceTriIds;
+            _usesRuntimeTetSurfaceTopology = runtimeTopology;
 
-            Debug.Log("[SofaUnityVisualLiverRenderer] Tet surface renderer built from current liver3-HD mesh | vertices=" +
-                      count + " | triangles=" + (_triangles.Length / 3) +
-                      " | topologyOutwardFlipped=" + flipped +
-                      " | fallbackFaces=" + fallbackFaces);
+            if (!runtimeTopology)
+            {
+                Debug.Log("[SofaUnityVisualLiverRenderer] Tet surface renderer built from current liver3-HD mesh | vertices=" +
+                          count + " | triangles=" + (_triangles.Length / 3) +
+                          " | topologyOutwardFlipped=" + flipped +
+                          " | fallbackFaces=" + fallbackFaces);
+            }
         }
 
         void RefreshTetSurfaceMesh()
         {
             if (_data == null || _mesh == null) return;
 
+            bool sourceTopologyChanged =
+                !_usesRuntimeTetSurfaceTopology &&
+                (_data.SurfaceTriIds == null ||
+                 _data.SurfaceTriIds.Length != _boundSurfaceTriLength ||
+                 !ReferenceEquals(_data.SurfaceTriIds, _boundSurfaceTriRef));
+
             bool topologyChanged =
                 _data.NumParticles != _boundParticleCount ||
                 _data.NumTets != _boundTetCount ||
-                _data.SurfaceTriIds == null ||
-                _data.SurfaceTriIds.Length != _boundSurfaceTriLength ||
-                !ReferenceEquals(_data.SurfaceTriIds, _boundSurfaceTriRef) ||
+                sourceTopologyChanged ||
                 _deformedVertices == null ||
                 _deformedVertices.Length != _data.NumParticles;
 
             if (topologyChanged)
             {
-                if (_data.SurfaceTriIds != null && _data.SurfaceTriIds.Length >= 3)
-                    BuildTetSurfaceMesh(_data);
+                BuildTetSurfaceMesh(
+                    _data,
+                    _data.SurfaceTriIds,
+                    runtimeTopology: _usesRuntimeTetSurfaceTopology);
                 return;
             }
 
@@ -425,6 +451,17 @@ namespace SurgicalSim.Rendering
             _mesh.SetVertices(_deformedVertices, 0, _data.NumParticles);
             _mesh.RecalculateNormals();
             _mesh.RecalculateBounds();
+        }
+
+        static int[] CopyTriangles(IList<int> triangles)
+        {
+            if (triangles == null || triangles.Count == 0)
+                return Array.Empty<int>();
+
+            var copy = new int[triangles.Count];
+            for (int i = 0; i < triangles.Count; i++)
+                copy[i] = triangles[i];
+            return copy;
         }
 
         void BuildRestVertices(TetMeshData data)

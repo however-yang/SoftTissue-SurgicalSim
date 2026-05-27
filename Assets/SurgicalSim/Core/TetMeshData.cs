@@ -170,6 +170,12 @@ namespace SurgicalSim.Core
             TetIds = newIds;
         }
 
+        public void SetSurfaceTriIds(int[] newIds)
+        {
+            SurfaceTriIds = newIds ?? new int[0];
+            NumSurfaceTris = SurfaceTriIds.Length / 3;
+        }
+
         /// <summary>更新粒子數量（vertex splitting 後）</summary>
         public void SetNumParticles(int n)
         {
@@ -251,14 +257,12 @@ namespace SurgicalSim.Core
             return newIdx;
         }
 
-        /// <summary>停用一个四面体</summary>
+        /// <summary>更新 RestVolumes（外部可写）</summary>
         public void DeactivateTet(int t)
         {
             if (t >= 0 && t < NumTets) TetActive[t] = false;
         }
 
-
-        /// <summary>更新 RestVolumes（外部可写）</summary>
         public void SetRestVolumes(float[] rv) { RestVolumes = rv; }
 
         // ── 工具方法 ─────────────────────────────────────────

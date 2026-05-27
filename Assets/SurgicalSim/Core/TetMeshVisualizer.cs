@@ -114,6 +114,7 @@ namespace SurgicalSim.Core
                             ? UnityEngine.Rendering.IndexFormat.UInt32
                             : UnityEngine.Rendering.IndexFormat.UInt16
             };
+            _surfaceMesh.MarkDynamic();
 
             // 頂點緩存
             _surfaceVerts   = new Vector3[data.NumParticles];
@@ -134,6 +135,7 @@ namespace SurgicalSim.Core
             // 必须读回 getter 拿到渲染器实际使用的那个实例
             _meshFilter.mesh = _surfaceMesh;
             _surfaceMesh = _meshFilter.mesh;  // 捕获实际渲染实例
+            _surfaceMesh.MarkDynamic();
 
             // 設置材質
             if (surfaceMaterial != null)
@@ -196,6 +198,11 @@ namespace SurgicalSim.Core
             if (_meshRenderer == null || _surfaceMesh == null) return;
             ApplySurfaceMaterials(_surfaceMesh.subMeshCount > 1);
         }
+
+        public bool HasCutSurfaceSubmesh =>
+            _surfaceMesh != null &&
+            _surfaceMesh.subMeshCount > 1 &&
+            _surfaceMesh.GetIndexCount(1) > 0;
 
         /// <summary>
         /// 每幀物理求解後調用此方法刷新視覺網格
